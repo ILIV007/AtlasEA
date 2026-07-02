@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                              Contracts/Events.mqh|
-//|                            AtlasEA v1.0 - Event Contracts        |
+//|                            AtlasEA v1.1 - Event Contracts        |
 //+------------------------------------------------------------------+
 #ifndef ATLAS_EVENTS_MQH
 #define ATLAS_EVENTS_MQH

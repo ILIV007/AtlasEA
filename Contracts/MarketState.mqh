@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                          Contracts/MarketState.mqh|
-//|                            AtlasEA v1.0 - Market Data Contracts  |
+//|                            AtlasEA v1.1 - Market Data Contracts  |
 //+------------------------------------------------------------------+
 #ifndef ATLAS_MARKET_STATE_MQH
 #define ATLAS_MARKET_STATE_MQH

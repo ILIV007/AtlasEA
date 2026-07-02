@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                         Contracts/RiskDecision.mqh|
-//|                       AtlasEA v1.0 - Risk / Decision Contracts   |
+//|                       AtlasEA v1.1 - Risk / Decision Contracts   |
 //+------------------------------------------------------------------+
 #ifndef ATLAS_RISK_DECISION_MQH
 #define ATLAS_RISK_DECISION_MQH

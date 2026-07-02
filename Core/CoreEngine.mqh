@@ -1,192 +1,274 @@
 //+------------------------------------------------------------------+
-//|                                            Core/CoreEngine.mqh   |
-//|                AtlasEA v1.0 - Core Orchestrator (Event Bus)      |
+//|                                          Core/CoreEngine.mqh
+//|            AtlasEA v2.0 - Core Orchestrator & Event Bus           |
 //+------------------------------------------------------------------+
 #ifndef ATLAS_CORE_ENGINE_MQH
 #define ATLAS_CORE_ENGINE_MQH
 
 #include "../Config/Settings.mqh"
 #include "../Contracts/Events.mqh"
-#include "../Core/IEventBus.mqh"
-#include "../Core/AtlasContext.mqh"
-#include "../Core/RingBuffer.mqh"
-#include "../Core/ContextGuardian.mqh"
-#include "../Engines/MarketEngine.mqh"
-#include "../Engines/StrategyEngine.mqh"
-#include "../Engines/RiskEngine.mqh"
-#include "../Engines/ExecutionEngine.mqh"
-#include "../Infrastructure/MT5Adapter.mqh"
-#include "../Infrastructure/TradeManager.mqh"
-#include "../Infrastructure/PersistenceManager.mqh"
+#include "../Interfaces/IEventBus.mqh"
+#include "../Interfaces/ILogger.mqh"
+#include "../Interfaces/IContextStore.mqh"
+#include "../Interfaces/IMarketDataSource.mqh"
+#include "../Interfaces/IStrategySet.mqh"
+#include "../Interfaces/IRiskEvaluator.mqh"
+#include "../Interfaces/IOrderBuilder.mqh"
+#include "../Interfaces/IBrokerAdapter.mqh"
+#include "../Interfaces/IPositionStore.mqh"
+#include "../Interfaces/IStateStore.mqh"
+#include "AtlasContext.mqh"
+#include "NullLogger.mqh"
+#include "ContextGuardian.mqh"
+#include "ContextFactory.mqh"
+#include "PermissionMatrix.mqh"
+#include "RingBuffer.mqh"
+#include "EventQueue.mqh"
+#include "EventDispatcher.mqh"
+#include "SnapshotManager.mqh"
+#include "PhaseScheduler.mqh"
+#include "TimeBudgetRunner.mqh"
+#include "KillSwitchPropagator.mqh"
+#include "PipelineStatistics.mqh"
+#include "ModuleRegistry.mqh"
 
-//+------------------------------------------------------------------+
-//| CoreEngine                                                       |
-//|   - implements IEventBus (single event sink for the whole EA)    |
-//|   - runs the 4-phase pipeline per tick:                          |
-//|       Market -> Strategy -> Risk -> Execution                    |
-//|   - enforces phase budget (max_ms_per_tick)                      |
-//|   - assigns monotonic snapshot_id                                |
-//|   - ContextGuardian enforces single-writer on shared state       |
-//+------------------------------------------------------------------+
+/**
+ * @class CoreEngine
+ * @brief Central orchestrator implementing IEventBus.
+ *
+ * Owns all Core infrastructure (context, queues, guardian, scheduler, etc.)
+ * and wires injected engine/infra implementations via their interfaces.
+ *
+ * Responsibilities:
+ *   - IEventBus implementation (Enqueue into EventQueue)
+ *   - Lifecycle: Initialize / Shutdown
+ *   - Tick pipeline: OnTick → PhaseScheduler.RunPipeline → EventDispatcher.ProcessBatch
+ *   - Heartbeat: OnTimer → periodic snapshots, position reconciliation, exposure updates
+ *   - Trade events: OnTrade → broker position reconciliation
+ *   - Kill switch propagation
+ *   - Daily reset detection
+ *   - Module registration and discovery
+ *
+ * Memory: all Core components are stack-allocated. Engine/infra implementations
+ * are injected as pointers (owned by the caller — typically AtlasEA.mq5).
+ * No dynamic allocation in OnTick/OnTimer/OnTrade.
+ *
+ * Thread model: MQL5 single-threaded. No locks.
+ */
 class CoreEngine : public IEventBus
 {
 private:
-    AtlasConfig       m_config;
-    AtlasContext      m_context;
-    ContextGuardian   m_guardian;
-    EventRingBuffer   m_event_queue;
-    EventRingBuffer   m_priority_queue;
+    //=== Configuration ===
+    AtlasConfig m_config;
 
-    MarketEngine      m_market_engine;
-    StrategyEngine    m_strategy_engine;
-    RiskEngine        m_risk_engine;
-    ExecutionEngine   m_execution_engine;
-    MT5Adapter       *m_mt5_adapter;
-    TradeManager     *m_trade_manager;
-    PersistenceManager m_persistence;
+    //=== Logger ===
+    ILogger     *m_logger;          ///< Injected logger (or NullLogger)
+    NullLogger   m_null_logger;     ///< Default no-op logger
+    bool         m_owns_logger;     ///< true if we created the logger
 
-    long              m_current_snapshot_id;
-    datetime          m_last_snapshot_time;
-    datetime          m_last_heartbeat_time;
-    datetime          m_last_daily_check;
-    MarketState       m_last_market_state;
-    bool              m_initialized;
-    bool              m_shutdown_requested;
+    //=== Core infrastructure (stack-allocated, owned) ===
+    AtlasContext        m_context;
+    PermissionMatrix    m_permission_matrix;
+    ContextGuardian     m_guardian;
+    ContextFactory      m_context_factory;
+    EventQueue          m_event_queue;
+    EventDispatcher     m_dispatcher;
+    SnapshotManager     m_snapshot_mgr;
+    PhaseScheduler      m_scheduler;
+    TimeBudgetRunner    m_budget;
+    KillSwitchPropagator m_kill_switch;
+    PipelineStatistics  m_stats;
+    ModuleRegistry      m_registry;
 
-    //--- internal helpers
-    void   ProcessEvent(const AtlasEvent &event);
-    void   RunMarketPhase(const RawTick &tick);
-    void   RunStrategyPhase(const MarketState &state);
-    void   RunRiskPhase(const AggregatedVote &vote);
-    void   RunExecutionPhase(const RiskDecision &decision);
-    AggregatedVote AggregateVotes(const StrategyVote &votes[], int count);
-    string GenerateId(const string &prefix);
-    bool   CheckDailyReset(void);
-    void   EmitSimpleEvent(ENUM_ATLAS_EVENT_TYPE type, const string &source, long snapshot_id);
+    //=== Injected engine/infra (NOT owned — caller manages lifetime) ===
+    IMarketDataSource *m_market_engine;
+    IStrategySet      *m_strategy_engine;
+    IRiskEvaluator    *m_risk_engine;
+    IOrderBuilder     *m_execution_engine;
+    IBrokerAdapter    *m_broker_adapter;
+    IPositionStore    *m_trade_manager;
+    IStateStore       *m_persistence;
+
+    //=== State ===
+    bool m_initialized;
+    bool m_shutdown_requested;
+    datetime m_last_heartbeat_time;
+    datetime m_last_daily_check;
+
+    /// @brief Register all default permissions in the matrix.
+    void RegisterDefaultPermissions(void);
+
+    /// @brief Register all Core modules in the registry.
+    void RegisterCoreModules(void);
+
+    /// @brief Check and perform daily reset if needed.
+    void CheckDailyReset(void);
+
+    /// @brief Emit a simple flow event.
+    void EmitSimpleEvent(const ENUM_ATLAS_EVENT_TYPE type, const string source, const long snapshot_id);
 
 public:
-                CoreEngine(void);
-               ~CoreEngine(void);
+    /**
+     * @brief Constructor — initializes all members to safe defaults.
+     */
+    CoreEngine(void);
 
-    bool        Initialize(const AtlasConfig &config);
-    void        Shutdown(int reason);
+    /**
+     * @brief Destructor — calls Shutdown if not already called.
+     */
+    ~CoreEngine(void);
 
-    void        OnTick(void);
-    void        OnTrade(void);
-    void        OnTimer(void);
+    //=== Lifecycle ===
 
-    //--- IEventBus interface
-    virtual void EmitEvent(const AtlasEvent &event);
-    virtual void EmitPriorityEvent(const AtlasEvent &event);
+    /**
+     * @brief Initialize the CoreEngine with config and injected dependencies.
+     * @param config    EA configuration.
+     * @param logger    Logger (may be NULL — NullLogger used as default).
+     * @param market    Market data source (may be NULL — pipeline skips market phase).
+     * @param strategy  Strategy set (may be NULL — pipeline skips strategy phase).
+     * @param risk      Risk evaluator (may be NULL — pipeline skips risk phase).
+     * @param execution Order builder (may be NULL — pipeline skips execution phase).
+     * @param broker    Broker adapter (REQUIRED — tick capture needs this).
+     * @param trade     Position store (may be NULL — no position tracking).
+     * @param persistence State store (may be NULL — no persistence).
+     * @return true if initialization succeeded.
+     */
+    bool Initialize(const AtlasConfig &config,
+                    ILogger *logger,
+                    IMarketDataSource *market,
+                    IStrategySet *strategy,
+                    IRiskEvaluator *risk,
+                    IOrderBuilder *execution,
+                    IBrokerAdapter *broker,
+                    IPositionStore *trade,
+                    IStateStore *persistence);
 
-    int         ProcessQueueBudget(ulong max_ms, int max_events);
-    long        AssignSnapshotId(void);
-    void        TriggerSnapshot(void);
-    bool        ValidateWriteAccess(int module_id, int contract_type);
+    /**
+     * @brief Shutdown the engine. Flushes state, releases resources.
+     * @param reason Shutdown reason code.
+     */
+    void Shutdown(const int reason);
+
+    //=== MT5 Event Handlers ===
+
+    /**
+     * @brief Called on every tick. Runs the pipeline + drains events.
+     */
+    void OnTick(void);
+
+    /**
+     * @brief Called on trade events. Reconciles positions.
+     */
+    void OnTrade(void);
+
+    /**
+     * @brief Called on timer. Heartbeat + snapshot + queue drain.
+     */
+    void OnTimer(void);
+
+    //=== IEventBus implementation ===
+
+    virtual void EmitEvent(const AtlasEvent &event) override;
+    virtual void EmitPriorityEvent(const AtlasEvent &event) override;
+
+    //=== Accessors ===
+
+    /// @brief Get the context store (read+write interface).
+    IContextStore* GetContext(void) { return &m_context; }
+
+    /// @brief Get the pipeline statistics.
+    const PipelineStatistics& GetStats(void) const { return m_stats; }
+
+    /// @brief Get the module registry.
+    const ModuleRegistry& GetRegistry(void) const { return m_registry; }
+
+    /// @brief Get the event queue.
+    const EventQueue& GetQueue(void) const { return m_event_queue; }
+
+    /// @brief Get the kill switch propagator.
+    KillSwitchPropagator& GetKillSwitch(void) { return m_kill_switch; }
+
+    /// @brief Is the engine initialized?
+    bool IsInitialized(void) const { return m_initialized; }
+
+    /// @brief Is the kill switch active?
+    bool IsKillSwitchActive(void) const { return m_context.IsKillSwitchActive(); }
 };
 
 //+------------------------------------------------------------------+
+//| CoreEngine implementation                                         |
+//+------------------------------------------------------------------+
+
 CoreEngine::CoreEngine(void)
 {
-    m_current_snapshot_id  = 0;
-    m_last_snapshot_time   = 0;
-    m_last_heartbeat_time  = 0;
-    m_last_daily_check     = 0;
-    m_initialized          = false;
-    m_shutdown_requested   = false;
-    m_mt5_adapter          = NULL;
-    m_trade_manager        = NULL;
+    m_logger           = NULL;
+    m_owns_logger      = false;
+
+    m_market_engine    = NULL;
+    m_strategy_engine  = NULL;
+    m_risk_engine      = NULL;
+    m_execution_engine = NULL;
+    m_broker_adapter   = NULL;
+    m_trade_manager    = NULL;
+    m_persistence      = NULL;
+
+    m_initialized       = false;
+    m_shutdown_requested = false;
+    m_last_heartbeat_time = 0;
+    m_last_daily_check   = 0;
 }
 
 //+------------------------------------------------------------------+
 CoreEngine::~CoreEngine(void)
 {
-    Shutdown(0);
-    if(m_mt5_adapter != NULL)   { delete m_mt5_adapter;   m_mt5_adapter   = NULL; }
-    if(m_trade_manager != NULL) { delete m_trade_manager; m_trade_manager = NULL; }
+    if(m_initialized)
+        Shutdown(0);
 }
 
 //+------------------------------------------------------------------+
-//| Initialize - wire up all engines and the event bus               |
-//+------------------------------------------------------------------+
-bool CoreEngine::Initialize(const AtlasConfig &config)
+void CoreEngine::RegisterDefaultPermissions(void)
 {
-    m_config = config;
+    //--- Each module gets write access to the context contract
+    m_permission_matrix.GrantPermission(ATLAS_MODULE_CORE,      ATLAS_CONTRACT_CONTEXT);
+    m_permission_matrix.GrantPermission(ATLAS_MODULE_MARKET,    ATLAS_CONTRACT_MARKET_STATE);
+    m_permission_matrix.GrantPermission(ATLAS_MODULE_STRATEGY,  ATLAS_CONTRACT_RISK_DECISION);
+    m_permission_matrix.GrantPermission(ATLAS_MODULE_RISK,      ATLAS_CONTRACT_CONTEXT);
+    m_permission_matrix.GrantPermission(ATLAS_MODULE_RISK,      ATLAS_CONTRACT_RISK_DECISION);
+    m_permission_matrix.GrantPermission(ATLAS_MODULE_EXECUTION, ATLAS_CONTRACT_ORDER_REQUEST);
+    m_permission_matrix.GrantPermission(ATLAS_MODULE_MT5,       ATLAS_CONTRACT_EVENT);
+    m_permission_matrix.GrantPermission(ATLAS_MODULE_TRADE,     ATLAS_CONTRACT_CONTEXT);
+    m_permission_matrix.GrantPermission(ATLAS_MODULE_PERSISTENCE, ATLAS_CONTRACT_CONTEXT);
+}
 
-    m_guardian.Attach(GetPointer(m_context));
+//+------------------------------------------------------------------+
+void CoreEngine::RegisterCoreModules(void)
+{
+    m_registry.Register(ATLAS_MODULE_CORE,        "CoreEngine",       ATLAS_VERSION_STRING);
+    m_registry.Register(ATLAS_MODULE_MARKET,      "MarketEngine",     "pending");
+    m_registry.Register(ATLAS_MODULE_STRATEGY,    "StrategyEngine",   "pending");
+    m_registry.Register(ATLAS_MODULE_RISK,        "RiskEngine",       "pending");
+    m_registry.Register(ATLAS_MODULE_EXECUTION,   "ExecutionEngine",  "pending");
+    m_registry.Register(ATLAS_MODULE_MT5,         "MT5Adapter",       "pending");
+    m_registry.Register(ATLAS_MODULE_TRADE,       "TradeManager",     "pending");
+    m_registry.Register(ATLAS_MODULE_PERSISTENCE, "PersistenceManager","pending");
+}
 
-    m_mt5_adapter   = new MT5Adapter(this);
-    m_trade_manager = new TradeManager(this);
-
-    if(!m_market_engine.Initialize(m_config))      { Print("[Core] MarketEngine init failed");       return false; }
-    if(!m_strategy_engine.Initialize(m_config))    { Print("[Core] StrategyEngine init failed");     return false; }
-    if(!m_risk_engine.Initialize(m_config, GetPointer(m_context))) { Print("[Core] RiskEngine init failed"); return false; }
-    if(!m_execution_engine.Initialize(m_config, GetPointer(m_context))) { Print("[Core] ExecutionEngine init failed"); return false; }
-    if(!m_mt5_adapter.Initialize(m_config))        { Print("[Core] MT5Adapter init failed");         return false; }
-    if(!m_trade_manager.Initialize(m_config, GetPointer(m_context))) { Print("[Core] TradeManager init failed"); return false; }
-    if(!m_persistence.Initialize(m_config, GetPointer(m_context)))   { Print("[Core] PersistenceManager init failed"); return false; }
-
-    //--- attempt state recovery
-    m_persistence.RecoverState(m_context);
-
-    //--- if kill switch was active on a previous (same-day) session, keep it
-    //--- otherwise seed daily stats
-    if(!m_context.kill_switch_active)
+//+------------------------------------------------------------------+
+void CoreEngine::CheckDailyReset(void)
+{
+    if(m_context_factory.IsNewTradingDay(m_context))
     {
-        m_context.trading_day_start  = TimeCurrent();
-        m_context.daily_start_equity = AccountInfoDouble(ACCOUNT_EQUITY);
-        m_context.daily_peak_equity  = m_context.daily_start_equity;
+        double equity = (m_broker_adapter != NULL) ? m_broker_adapter.AccountEquity() : 0.0;
+        m_context_factory.ResetDaily(m_context, equity);
+        m_kill_switch.Deactivate(m_snapshot_mgr.CurrentId());
+
+        if(m_logger != NULL)
+            m_logger.Info("CoreEngine", "New trading day — daily limits reset, kill switch cleared");
     }
-    m_last_daily_check = TimeCurrent();
-
-    EventSetTimer(m_config.heartbeat_interval_sec);
-
-    m_initialized = true;
-    Print("[CoreEngine] AtlasEA v1.0 initialized. Symbol=", m_config.symbol,
-          " Magic=", m_config.magic_number,
-          " KillSwitch=", m_context.kill_switch_active);
-    return true;
 }
 
 //+------------------------------------------------------------------+
-void CoreEngine::Shutdown(int reason)
-{
-    if(!m_initialized) return;
-    m_shutdown_requested = true;
-
-    EventKillTimer();
-
-    EmitSimpleEvent(EV_SYSTEM_SHUTDOWN, "CoreEngine", m_current_snapshot_id);
-
-    //--- drain the queues
-    ProcessQueueBudget(1000, 200);
-
-    //--- final snapshot
-    m_persistence.WriteSnapshot(m_context, m_current_snapshot_id);
-    m_persistence.FlushEventBuffer();
-
-    m_market_engine.Shutdown();
-
-    m_initialized = false;
-    Print("[CoreEngine] Shutdown complete (reason=", reason, ")");
-}
-
-//+------------------------------------------------------------------+
-long CoreEngine::AssignSnapshotId(void)
-{
-    m_current_snapshot_id++;
-    m_context.current_snapshot_id = m_current_snapshot_id;
-    return m_current_snapshot_id;
-}
-
-//+------------------------------------------------------------------+
-bool CoreEngine::ValidateWriteAccess(int module_id, int contract_type)
-{
-    return m_guardian.ValidateWriteAccess(module_id, contract_type);
-}
-
-//+------------------------------------------------------------------+
-void CoreEngine::EmitSimpleEvent(ENUM_ATLAS_EVENT_TYPE type, const string &source, long snapshot_id)
+void CoreEngine::EmitSimpleEvent(const ENUM_ATLAS_EVENT_TYPE type, const string source, const long snapshot_id)
 {
     AtlasEvent ev;
     ev.type          = type;
@@ -198,336 +280,295 @@ void CoreEngine::EmitSimpleEvent(ENUM_ATLAS_EVENT_TYPE type, const string &sourc
 }
 
 //+------------------------------------------------------------------+
-//| IEventBus implementation                                         |
-//+------------------------------------------------------------------+
-void CoreEngine::EmitEvent(const AtlasEvent &event)
+bool CoreEngine::Initialize(const AtlasConfig &config,
+                            ILogger *logger,
+                            IMarketDataSource *market,
+                            IStrategySet *strategy,
+                            IRiskEvaluator *risk,
+                            IOrderBuilder *execution,
+                            IBrokerAdapter *broker,
+                            IPositionStore *trade,
+                            IStateStore *persistence)
 {
-    if(!m_event_queue.Enqueue(event))
+    if(m_initialized)
     {
-        //--- queue full -> emit an error to the priority queue
-        AtlasEvent err;
-        err.type          = EV_ERROR_OCCURRED;
-        err.source_module = "CoreEngine";
-        err.timestamp     = TimeCurrent();
-        err.snapshot_id   = event.snapshot_id;
-        err.payload_size  = 0;
-        m_priority_queue.Enqueue(err);
-    }
-    m_context.total_events_emitted++;
-}
-
-//+------------------------------------------------------------------+
-void CoreEngine::EmitPriorityEvent(const AtlasEvent &event)
-{
-    if(!m_priority_queue.Enqueue(event))
-        EmitEvent(event);  // fall back to normal queue
-    m_context.total_events_emitted++;
-}
-
-//+------------------------------------------------------------------+
-string CoreEngine::GenerateId(const string &prefix)
-{
-    return prefix + "_" + IntegerToString((long)TimeCurrent()) + "_" + IntegerToString(MathRand());
-}
-
-//+------------------------------------------------------------------+
-//| CheckDailyReset - roll daily risk stats on new trading day       |
-//+------------------------------------------------------------------+
-bool CoreEngine::CheckDailyReset(void)
-{
-    MqlDateTime now, start;
-    TimeToStruct(TimeCurrent(), now);
-    TimeToStruct(m_context.trading_day_start, start);
-    if(now.day != start.day || now.mon != start.mon || now.year != start.year)
-    {
-        m_risk_engine.ResetDailyLimits();
-        //--- clear kill switch on a new day (operator must explicitly re-enable)
-        m_context.kill_switch_active = false;
-        m_context.kill_switch_reason = "";
-        m_context.consecutive_losses = 0;
-        Print("[CoreEngine] New trading day - daily limits reset.");
+        if(logger != NULL)
+            logger.Warn("CoreEngine", "Initialize: already initialized");
         return true;
     }
-    return false;
+
+    m_config = config;
+
+    //--- Logger
+    if(logger != NULL)
+    {
+        m_logger      = logger;
+        m_owns_logger = false;
+    }
+    else
+    {
+        m_logger      = &m_null_logger;
+        m_owns_logger = false;  // NullLogger is a member, not dynamically allocated
+    }
+
+    //--- Store injected dependencies
+    m_market_engine    = market;
+    m_strategy_engine  = strategy;
+    m_risk_engine      = risk;
+    m_execution_engine = execution;
+    m_broker_adapter   = broker;
+    m_trade_manager    = trade;
+    m_persistence      = persistence;
+
+    //--- Validate required dependencies
+    if(m_broker_adapter == NULL)
+    {
+        m_logger.Error("CoreEngine", "Initialize: broker adapter is REQUIRED");
+        return false;
+    }
+
+    //--- Initialize Core infrastructure
+    m_permission_matrix.SetLogger(m_logger);
+    RegisterDefaultPermissions();
+    m_logger.Info("CoreEngine", "Permission matrix configured");
+
+    m_guardian.Attach(&m_permission_matrix, m_logger);
+    m_logger.Info("CoreEngine", "Context guardian attached");
+
+    m_context_factory.SetLogger(m_logger);
+
+    //--- Context: recover state if persistence is available
+    if(m_persistence != NULL)
+    {
+        if(m_persistence.RecoverState(m_context))
+            m_logger.Info("CoreEngine", "Context state recovered from persistence");
+        else
+            m_logger.Info("CoreEngine", "No previous state found — starting fresh");
+    }
+
+    //--- If no recovery, initialize fresh
+    if(m_context.GetTradingDayStart() == 0)
+    {
+        m_context_factory.InitializeFresh(m_context);
+        double equity = m_broker_adapter.AccountEquity();
+        m_context_factory.ResetDaily(m_context, equity);
+    }
+
+    //--- Event queue
+    m_event_queue.Initialize(m_logger, ATLAS_EVENT_QUEUE_SIZE, ATLAS_PRIORITY_QUEUE_SIZE);
+    m_logger.Info("CoreEngine", "Event queue initialized");
+
+    //--- Snapshot manager
+    m_snapshot_mgr.Initialize(&m_context, m_logger, m_config.snapshot_interval_sec);
+
+    //--- Kill switch propagator
+    m_kill_switch.Initialize(this, &m_context, m_logger);
+
+    //--- Pipeline statistics
+    m_stats.SetLogger(m_logger);
+
+    //--- Time budget runner
+    m_budget.Initialize(m_logger, m_config.max_ms_per_tick, m_config.max_events_per_tick);
+
+    //--- Event dispatcher
+    m_dispatcher.Initialize(&m_event_queue, &m_context, m_logger);
+
+    //--- Phase scheduler
+    m_scheduler.Initialize(this, &m_context, m_logger,
+                           m_market_engine, m_strategy_engine,
+                           m_risk_engine, m_execution_engine,
+                           m_broker_adapter,
+                           &m_snapshot_mgr, &m_stats, &m_budget,
+                           m_config);
+
+    //--- Module registry
+    m_registry.SetLogger(m_logger);
+    RegisterCoreModules();
+    m_registry.MarkInitialized(ATLAS_MODULE_CORE);
+
+    //--- Mark injected modules as initialized
+    if(m_market_engine    != NULL) m_registry.MarkInitialized(ATLAS_MODULE_MARKET);
+    if(m_strategy_engine  != NULL) m_registry.MarkInitialized(ATLAS_MODULE_STRATEGY);
+    if(m_risk_engine      != NULL) m_registry.MarkInitialized(ATLAS_MODULE_RISK);
+    if(m_execution_engine != NULL) m_registry.MarkInitialized(ATLAS_MODULE_EXECUTION);
+    if(m_broker_adapter   != NULL) m_registry.MarkInitialized(ATLAS_MODULE_MT5);
+    if(m_trade_manager    != NULL) m_registry.MarkInitialized(ATLAS_MODULE_TRADE);
+    if(m_persistence      != NULL) m_registry.MarkInitialized(ATLAS_MODULE_PERSISTENCE);
+
+    //--- Set up timer for heartbeat
+    EventSetTimer(m_config.heartbeat_interval_sec);
+
+    m_last_daily_check    = TimeCurrent();
+    m_last_heartbeat_time = TimeCurrent();
+
+    m_initialized = true;
+
+    m_logger.Info("CoreEngine",
+        "AtlasEA v" + ATLAS_VERSION_STRING + " initialized. " +
+        "Symbol=" + m_config.symbol + " " +
+        "Magic=" + IntegerToString(m_config.magic_number) + " " +
+        "KillSwitch=" + (m_context.IsKillSwitchActive() ? "ACTIVE" : "inactive"));
+
+    m_registry.LogStatus();
+
+    return true;
 }
 
 //+------------------------------------------------------------------+
-//| OnTick - the main per-tick entry point                           |
+void CoreEngine::Shutdown(const int reason)
+{
+    if(!m_initialized) return;
+
+    m_shutdown_requested = true;
+
+    m_logger.Info("CoreEngine", "Shutdown initiated (reason=" + IntegerToString(reason) + ")");
+
+    //--- Emit shutdown event
+    EmitSimpleEvent(EV_SYSTEM_SHUTDOWN, "CoreEngine", m_snapshot_mgr.CurrentId());
+
+    //--- Drain remaining events (generous budget for shutdown)
+    m_budget.StartTick();
+    m_dispatcher.ProcessBatch(NULL, &m_stats);
+
+    //--- Final snapshot
+    if(m_persistence != NULL)
+    {
+        m_persistence.WriteSnapshot(m_context, m_snapshot_mgr.CurrentId());
+        m_persistence.FlushEventBuffer();
+    }
+
+    //--- Kill timer
+    EventKillTimer();
+
+    //--- Reset guardian ownerships
+    m_guardian.ResetAll();
+
+    //--- Log final statistics
+    m_stats.LogSummary();
+
+    m_logger.Info("CoreEngine", "Shutdown complete");
+
+    m_initialized = false;
+}
+
 //+------------------------------------------------------------------+
 void CoreEngine::OnTick(void)
 {
     if(!m_initialized || m_shutdown_requested) return;
 
-    ulong start_ms = GetTickCount64();
-    m_context.total_ticks_processed++;
-    m_context.current_tick_time = TimeCurrent();
+    //--- Start budget tracking
+    m_budget.StartTick();
+    ulong tick_start = GetTickCount64();
 
-    //--- daily reset check (cheap)
+    m_context.SetTickTime(TimeCurrent());
+    m_context.IncrementTicksProcessed();
+
+    //--- Daily reset check (cheap — only check every 60 seconds)
     if(TimeCurrent() - m_last_daily_check > 60)
     {
         CheckDailyReset();
         m_last_daily_check = TimeCurrent();
     }
 
-    //--- Phase 1: Market
-    RawTick tick = m_mt5_adapter.CaptureTick();
-    EmitSimpleEvent(EV_TICK_RECEIVED, "MT5Adapter", m_current_snapshot_id);
-    RunMarketPhase(tick);
+    //--- Run the 4-phase pipeline (Market → Strategy → Risk → Execution)
+    m_scheduler.RunPipeline();
 
-    //--- drain queued events within remaining budget
-    ulong elapsed   = GetTickCount64() - start_ms;
-    ulong remaining = (m_config.max_ms_per_tick > elapsed)
-                      ? (m_config.max_ms_per_tick - elapsed) : 0;
-    ProcessQueueBudget(remaining, m_config.max_events_per_tick);
+    //--- Drain queued events within remaining budget
+    m_dispatcher.ProcessBatch(&m_budget, &m_stats);
+
+    //--- Record tick statistics
+    double total_ms = (double)(GetTickCount64() - tick_start);
+    m_stats.RecordTick(total_ms, m_budget.LastTickOverrun());
+
+    //--- Increment context events counter
+    m_context.IncrementEventsEmitted();
 }
 
-//+------------------------------------------------------------------+
-//| RunMarketPhase - capture tick -> MarketState                     |
-//+------------------------------------------------------------------+
-void CoreEngine::RunMarketPhase(const RawTick &tick)
-{
-    long snap_id = AssignSnapshotId();
-
-    //--- single-writer enforcement
-    if(!m_guardian.AcquireWriteAccess(ATLAS_MODULE_MARKET, ATLAS_CONTRACT_MARKET_STATE))
-    {
-        Print("[Core] Write access denied for MarketEngine");
-        return;
-    }
-    MarketState state = m_market_engine.ProcessTick(tick, snap_id);
-    m_guardian.ReleaseWriteAccess(ATLAS_MODULE_MARKET, ATLAS_CONTRACT_MARKET_STATE);
-
-    m_last_market_state = state;
-
-    EmitSimpleEvent(EV_MARKET_STATE_UPDATED, "MarketEngine", snap_id);
-
-    if(state.is_valid && !m_context.kill_switch_active)
-        RunStrategyPhase(state);
-}
-
-//+------------------------------------------------------------------+
-//| RunStrategyPhase - evaluate strategies -> votes -> aggregate     |
-//+------------------------------------------------------------------+
-void CoreEngine::RunStrategyPhase(const MarketState &state)
-{
-    StrategyVote votes[ATLAS_MAX_VOTES];
-    int count = m_strategy_engine.EvaluateStrategies(state, votes);
-    if(count == 0) return;
-
-    for(int i = 0; i < count; i++)
-        EmitSimpleEvent(EV_STRATEGY_VOTE_SUBMITTED, "StrategyEngine", state.snapshot_id);
-
-    AggregatedVote agg = AggregateVotes(votes, count);
-
-    EmitSimpleEvent(EV_VOTES_AGGREGATED, "StrategyEngine", state.snapshot_id);
-
-    RunRiskPhase(agg);
-}
-
-//+------------------------------------------------------------------+
-//| AggregateVotes - confidence-weighted direction vote              |
-//+------------------------------------------------------------------+
-AggregatedVote CoreEngine::AggregateVotes(const StrategyVote &votes[], int count)
-{
-    AggregatedVote agg;
-    agg.aggregation_id = GenerateId("AGG");
-    agg.vote_count     = count;
-    agg.snapshot_id    = (count > 0) ? votes[0].snapshot_id : 0;
-
-    double sum_buy_conf  = 0.0;
-    double sum_sell_conf = 0.0;
-
-    for(int i = 0; i < count; i++)
-    {
-        agg.votes[i] = votes[i];
-        if(votes[i].direction == ATLAS_ORDER_BUY)
-            sum_buy_conf  += votes[i].confidence;
-        else if(votes[i].direction == ATLAS_ORDER_SELL)
-            sum_sell_conf += votes[i].confidence;
-    }
-
-    if(sum_buy_conf > sum_sell_conf && sum_buy_conf > 0.0)
-    {
-        agg.direction  = ATLAS_ORDER_BUY;
-        agg.confidence = sum_buy_conf / count;
-    }
-    else if(sum_sell_conf > 0.0)
-    {
-        agg.direction  = ATLAS_ORDER_SELL;
-        agg.confidence = sum_sell_conf / count;
-    }
-    else
-    {
-        agg.direction  = ATLAS_ORDER_NONE;
-        agg.confidence = 0.0;
-    }
-    return agg;
-}
-
-//+------------------------------------------------------------------+
-//| RunRiskPhase - render RiskDecision from AggregatedVote            |
-//+------------------------------------------------------------------+
-void CoreEngine::RunRiskPhase(const AggregatedVote &vote)
-{
-    RiskDecision dec = m_risk_engine.EvaluateRisk(vote);
-
-    EmitSimpleEvent(EV_RISK_DECISION_RENDERED, "RiskEngine", vote.snapshot_id);
-
-    if(dec.status == ATLAS_DECISION_APPROVED)
-        RunExecutionPhase(dec);
-    else if(dec.kill_switch_triggered || m_context.kill_switch_active)
-        EmitSimpleEvent(EV_KILL_SWITCH_ACTIVATED, "RiskEngine", vote.snapshot_id);
-}
-
-//+------------------------------------------------------------------+
-//| RunExecutionPhase - build OrderRequest -> dispatch via adapter   |
-//+------------------------------------------------------------------+
-void CoreEngine::RunExecutionPhase(const RiskDecision &decision)
-{
-    OrderRequest req;
-    if(!m_execution_engine.BuildOrderRequest(decision, m_last_market_state, req))
-    {
-        Print("[Core] BuildOrderRequest failed for decision ", decision.decision_id);
-        return;
-    }
-
-    EmitSimpleEvent(EV_ORDER_REQUESTED, "ExecutionEngine", decision.snapshot_id);
-
-    bool sent = m_mt5_adapter.SendOrder(req);
-    m_context.total_orders_sent++;
-
-    if(sent)
-        EmitSimpleEvent(EV_ORDER_DISPATCHED, "MT5Adapter", decision.snapshot_id);
-
-    //--- reconcile positions immediately after a send attempt
-    PositionSnapshotEvent snap = m_mt5_adapter.QueryBrokerPositions();
-    m_trade_manager.ReconcilePositions(snap);
-}
-
-//+------------------------------------------------------------------+
-//| OnTrade - broker trade event -> reconcile + emit                 |
 //+------------------------------------------------------------------+
 void CoreEngine::OnTrade(void)
 {
     if(!m_initialized) return;
-    m_mt5_adapter.CaptureTrade();
-    PositionSnapshotEvent snap = m_mt5_adapter.QueryBrokerPositions();
-    m_trade_manager.ReconcilePositions(snap);
+
+    //--- Reconcile positions via broker adapter
+    if(m_broker_adapter != NULL && m_trade_manager != NULL)
+    {
+        PositionSnapshotEvent snap = m_broker_adapter.QueryBrokerPositions();
+        m_trade_manager.ReconcilePositions(snap);
+    }
+
+    //--- Emit trade event
+    EmitSimpleEvent(EV_TRADE_EXECUTED, "CoreEngine", m_snapshot_mgr.CurrentId());
 }
 
-//+------------------------------------------------------------------+
-//| OnTimer - heartbeat + snapshot + queue drain                     |
 //+------------------------------------------------------------------+
 void CoreEngine::OnTimer(void)
 {
     if(!m_initialized) return;
+
     datetime now = TimeCurrent();
 
-    //--- heartbeat
+    //--- Heartbeat
     if((long)(now - m_last_heartbeat_time) >= m_config.heartbeat_interval_sec)
     {
         m_last_heartbeat_time = now;
-        m_trade_manager.UpdatePricesOnHeartbeat(m_last_market_state);
-        m_risk_engine.UpdateExposure();
-        EmitSimpleEvent(EV_HEARTBEAT, "CoreEngine", m_current_snapshot_id);
-    }
 
-    //--- periodic snapshot
-    if((long)(now - m_last_snapshot_time) >= m_config.snapshot_interval_sec)
-    {
-        TriggerSnapshot();
-        m_last_snapshot_time = now;
-    }
-
-    //--- drain queue (timer has more budget than a tick)
-    ProcessQueueBudget(500, 100);
-}
-
-//+------------------------------------------------------------------+
-void CoreEngine::TriggerSnapshot(void)
-{
-    long id = AssignSnapshotId();
-    if(m_persistence.WriteSnapshot(m_context, id))
-        EmitSimpleEvent(EV_STATE_PERSISTED, "PersistenceManager", id);
-}
-
-//+------------------------------------------------------------------+
-//| ProcessQueueBudget - drain events within time/count budget       |
-//+------------------------------------------------------------------+
-int CoreEngine::ProcessQueueBudget(ulong max_ms, int max_events)
-{
-    ulong start    = GetTickCount64();
-    int    processed = 0;
-
-    //--- priority queue first
-    while(!m_priority_queue.IsEmpty() && processed < max_events)
-    {
-        AtlasEvent ev;
-        if(!m_priority_queue.Dequeue(ev)) break;
-        ProcessEvent(ev);
-        processed++;
-        if(GetTickCount64() - start >= max_ms) break;
-    }
-
-    //--- normal queue
-    while(!m_event_queue.IsEmpty() && processed < max_events)
-    {
-        AtlasEvent ev;
-        if(!m_event_queue.Dequeue(ev)) break;
-        ProcessEvent(ev);
-        processed++;
-        if(GetTickCount64() - start >= max_ms) break;
-    }
-    return processed;
-}
-
-//+------------------------------------------------------------------+
-//| ProcessEvent - dispatch a single event to its handler             |
-//+------------------------------------------------------------------+
-void CoreEngine::ProcessEvent(const AtlasEvent &event)
-{
-    switch(event.type)
-    {
-        case EV_TICK_RECEIVED:
-        case EV_MARKET_STATE_UPDATED:
-        case EV_STRATEGY_VOTE_SUBMITTED:
-        case EV_VOTES_AGGREGATED:
-        case EV_RISK_DECISION_RENDERED:
-        case EV_ORDER_REQUESTED:
-        case EV_ORDER_DISPATCHED:
-            //--- these are flow signals; no side effect beyond logging
-            m_persistence.AppendEvent(event);
-            break;
-
-        case EV_TRADE_EXECUTED:
+        //--- Update floating PnL
+        if(m_trade_manager != NULL)
         {
-            PositionSnapshotEvent snap = m_mt5_adapter.QueryBrokerPositions();
-            m_trade_manager.ReconcilePositions(snap);
-            m_persistence.AppendEvent(event);
-            break;
+            MarketState state = m_scheduler.LastMarketState();
+            if(state.is_valid)
+                m_trade_manager.UpdatePricesOnHeartbeat(state);
         }
 
-        case EV_ERROR_OCCURRED:
-            Print("[Core] ERROR event from ", event.source_module,
-                  " snapshot=", event.snapshot_id);
-            break;
+        //--- Update exposure
+        if(m_risk_engine != NULL)
+            m_risk_engine.UpdateExposure();
 
-        case EV_HEARTBEAT:
-            m_persistence.AppendEvent(event);
-            break;
-
-        case EV_STATE_PERSISTED:
-            break;
-
-        case EV_SYSTEM_SHUTDOWN:
-            Print("[Core] Shutdown event propagated.");
-            break;
-
-        case EV_KILL_SWITCH_ACTIVATED:
-            Print("[Core] *** KILL SWITCH ACTIVE *** - trading halted.");
-            m_persistence.AppendEvent(event);
-            break;
+        EmitSimpleEvent(EV_HEARTBEAT, "CoreEngine", m_snapshot_mgr.CurrentId());
     }
+
+    //--- Periodic snapshot
+    if(m_snapshot_mgr.IsSnapshotDue(now) && m_persistence != NULL)
+    {
+        if(m_persistence.WriteSnapshot(m_context, m_snapshot_mgr.CurrentId()))
+        {
+            m_snapshot_mgr.MarkSnapshotPersisted(now);
+            EmitSimpleEvent(EV_STATE_PERSISTED, "CoreEngine", m_snapshot_mgr.CurrentId());
+        }
+    }
+
+    //--- Drain queue with a generous budget (timer is not as time-critical as tick)
+    m_budget.StartTick();
+    m_dispatcher.ProcessBatch(&m_budget, &m_stats);
+}
+
+//+------------------------------------------------------------------+
+//| IEventBus implementation                                          |
+//+------------------------------------------------------------------+
+void CoreEngine::EmitEvent(const AtlasEvent &event)
+{
+    if(!m_initialized) return;
+
+    if(!m_event_queue.Enqueue(event))
+    {
+        //--- Queue full — emit an error event to priority queue
+        AtlasEvent err;
+        err.type          = EV_ERROR_OCCURRED;
+        err.source_module = "CoreEngine";
+        err.timestamp     = TimeCurrent();
+        err.snapshot_id   = event.snapshot_id;
+        err.payload_size  = 0;
+        m_event_queue.EnqueuePriority(err);
+    }
+    m_context.IncrementEventsEmitted();
+}
+
+//+------------------------------------------------------------------+
+void CoreEngine::EmitPriorityEvent(const AtlasEvent &event)
+{
+    if(!m_initialized) return;
+    m_event_queue.EnqueuePriority(event);
+    m_context.IncrementEventsEmitted();
 }
 
 #endif // ATLAS_CORE_ENGINE_MQH

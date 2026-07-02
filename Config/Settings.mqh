@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                               Config/Settings.mqh|
-//|                            AtlasEA v1.0 - Configuration Center   |
+//|                            AtlasEA v1.1 - Configuration Center   |
 //+------------------------------------------------------------------+
 #ifndef ATLAS_SETTINGS_MQH
 #define ATLAS_SETTINGS_MQH
@@ -32,6 +32,12 @@
 #define ATLAS_MAX_POSITIONS        64
 #define ATLAS_PAYLOAD_MAX_SIZE     256
 #define ATLAS_EVENT_LOG_BUFFER     64
+#define ATLAS_IDEMPOTENCY_SLOTS    32
+#define ATLAS_LATENCY_SAMPLES      256
+
+//--- Runtime budget (MQL5 OnTick constraints)
+#define ATLAS_MAX_MS_PER_TICK      50
+#define ATLAS_MAX_EVENTS_PER_TICK  8
 
 //--- Risk thresholds
 #define ATLAS_KILL_SWITCH_DRAWDOWN   8.0
@@ -74,6 +80,18 @@
 #define ATLAS_SESSION_LONDON   2
 #define ATLAS_SESSION_NY       3
 #define ATLAS_SESSION_OVERLAP  4
+
+//--- Log levels
+#define ATLAS_LOG_DEBUG   0
+#define ATLAS_LOG_INFO    1
+#define ATLAS_LOG_WARN    2
+#define ATLAS_LOG_ERROR   3
+#define ATLAS_LOG_FATAL   4
+
+//--- Version
+#define ATLAS_VERSION_MAJOR  2
+#define ATLAS_VERSION_MINOR  0
+#define ATLAS_VERSION_STRING "2.0"
 
 //+------------------------------------------------------------------+
 //| AtlasConfig - runtime configuration                              |
@@ -118,6 +136,8 @@ struct AtlasConfig
     double  max_spread_points;
     double  fast_market_atr_mult;
     int     slippage_points;
+
+    int     log_level;
 };
 
 //+------------------------------------------------------------------+
@@ -132,8 +152,8 @@ void AtlasConfigDefaults(AtlasConfig &cfg)
     cfg.max_exposure_limit      = 0.20;
     cfg.snapshot_interval_sec   = 300;
     cfg.heartbeat_interval_sec  = 10;
-    cfg.max_events_per_tick     = 50;
-    cfg.max_ms_per_tick         = 50;
+    cfg.max_events_per_tick     = ATLAS_MAX_EVENTS_PER_TICK;
+    cfg.max_ms_per_tick         = ATLAS_MAX_MS_PER_TICK;
 
     cfg.base_volume             = 0.10;
     cfg.max_volume              = 1.00;
@@ -163,6 +183,8 @@ void AtlasConfigDefaults(AtlasConfig &cfg)
     cfg.max_spread_points       = 50.0;
     cfg.fast_market_atr_mult    = 2.5;
     cfg.slippage_points         = 20;
+
+    cfg.log_level               = ATLAS_LOG_INFO;
 }
 
 #endif // ATLAS_SETTINGS_MQH
