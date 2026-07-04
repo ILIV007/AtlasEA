@@ -1,237 +1,427 @@
 //+------------------------------------------------------------------+
-//|                                  Diagnostics/HealthMonitor.mqh   |
-//|             AtlasEA v0.1.8.0 - System Health Monitor              |
+//|                    Diagnostics/HealthMonitor.mqh                |
+//|       AtlasEA v0.1.12.0 - System Health Monitor (Full)          |
 //+------------------------------------------------------------------+
 #ifndef ATLAS_HEALTH_MONITOR_MQH
 #define ATLAS_HEALTH_MONITOR_MQH
 
 #include "../Config/Settings.mqh"
 #include "../Contracts/Events.mqh"
+#include "../Core/ValidationResult.mqh"
 #include "../Interfaces/IHealthMonitor.mqh"
 #include "../Interfaces/ILogger.mqh"
 #include "../Interfaces/IBrokerAdapter.mqh"
-#include "../Core/EventQueue.mqh"
-#include "../Core/PipelineStatistics.mqh"
+#include "../Interfaces/IPerformanceProfiler.mqh"
+#include "../Interfaces/ILatencyMonitor.mqh"
+#include "../Interfaces/IMemoryStatistics.mqh"
+#include "../Interfaces/IEventStatistics.mqh"
+#include "../Interfaces/IQueueStatistics.mqh"
+
+//--- Note: ATLAS_HEALTH_* macros and HealthReport struct are defined in
+//--- Interfaces/IHealthMonitor.mqh (the canonical source). This file
+//--- uses them — no redefinition here.
 
 /**
  * @class HealthMonitor
- * @brief Concrete implementation of IHealthMonitor.
+ * @brief Comprehensive system health monitor.
  *
- * Aggregates health metrics from:
- *   - EventQueue (queue depth, dropped events)
- *   - PipelineStatistics (pipeline + tick latency)
- *   - IBrokerAdapter (connectivity, trading enabled, market open)
- *   - MQLInfoInteger (memory usage)
- *   - Internal counters (errors, fatal errors)
+ * Aggregates data from all monitoring interfaces and produces a
+ * HealthReport with GREEN/YELLOW/RED status.
  *
- * The monitor does NOT own any of these sources — it holds pointers
- * and queries them on GetSnapshot(). All pointers are optional (NULL-safe).
- *
- * Memory: fixed-size. No dynamic allocation.
+ * GREEN: All systems nominal.
+ * YELLOW: Degraded but operational (warnings, slow but functional).
+ * RED: Critical — intervention required (kill switch, broker disconnect,
+ *      queue overflow, persistent failures).
  */
 class HealthMonitor : public IHealthMonitor
 {
 private:
-    ILogger            *m_logger;
-    EventQueue         *m_queue;       ///< For queue depth + dropped
-    PipelineStatistics *m_stats;       ///< For latency metrics
-    IBrokerAdapter     *m_broker;      ///< For connectivity
-    string               m_symbol;      ///< For market_open check
+    ILogger              *m_logger;
+    IBrokerAdapter       *m_broker;
+    IPerformanceProfiler *m_profiler;
+    ILatencyMonitor      *m_latency;
+    IMemoryStatistics    *m_memory;
+    IEventStatistics     *m_events;
+    IQueueStatistics     *m_queues;
+
+    //--- Thresholds
+    double m_slow_tick_ms;          ///< Tick latency threshold for "slow"
+    double m_slow_order_ms;         ///< Order latency threshold
+    double m_high_slippage_points;  ///< Slippage threshold
+    double m_memory_growth_pct;     ///< Memory growth threshold
+    int    m_queue_overflow_limit;  ///< Queue depth for overflow warning
 
     //--- Error tracking
-    string               m_last_fatal_error;
-    datetime             m_last_fatal_time;
-    ulong                m_total_errors;
+    string  m_last_fatal_error;
+    datetime m_last_fatal_time;
+    ulong   m_total_errors;
 
-    //--- Thresholds for "healthy" composite
-    int                  m_max_queue_depth_warn;
-    int                  m_max_queue_depth_critical;
-    double               m_max_tick_latency_ms;
-
-    /// @brief Compute the composite system_healthy flag.
-    void ComputeHealth(const HealthSnapshot &snap, bool &out_healthy, string &out_reason) const;
+    /// @brief Add an issue to the report.
+    void AddIssue(HealthReport &report, const ENUM_HEALTH_ISSUE_CODE code,
+                   const string description, const int severity) const
+    {
+        if(report.issue_count < 16)
+        {
+            report.issues[report.issue_count].code        = code;
+            report.issues[report.issue_count].description = description;
+            report.issues[report.issue_count].timestamp   = TimeCurrent();
+            report.issues[report.issue_count].severity    = severity;
+            report.issue_count++;
+        }
+    }
 
 public:
     /**
      * @brief Constructor.
      */
-    HealthMonitor(void);
+    HealthMonitor(void)
+    {
+        m_logger               = NULL;
+        m_broker               = NULL;
+        m_profiler             = NULL;
+        m_latency              = NULL;
+        m_memory               = NULL;
+        m_events               = NULL;
+        m_queues               = NULL;
+        m_slow_tick_ms         = 50.0;   ///< 50ms = slow tick
+        m_slow_order_ms        = 5000.0; ///< 5s = slow order
+        m_high_slippage_points = 20.0;   ///< 20 points = high slippage
+        m_memory_growth_pct    = 50.0;   ///< 50% growth = warning
+        m_queue_overflow_limit = 400;    ///< 400 events = overflow
+        m_last_fatal_time      = 0;
+        m_total_errors         = 0;
+    }
 
     /**
-     * @brief Set the data sources.
-     * @param logger  Logger.
-     * @param queue   Event queue (may be NULL — queue metrics will be 0).
-     * @param stats   Pipeline statistics (may be NULL — latency will be 0).
-     * @param broker  Broker adapter (may be NULL — connectivity will be false).
-     * @param symbol  Trading symbol (for market open check).
+     * @brief Set all data sources (dependency injection).
      */
-    void SetSources(ILogger *logger, EventQueue *queue,
-                    PipelineStatistics *stats, IBrokerAdapter *broker,
-                    const string symbol);
+    void SetSources(ILogger *logger,
+                    IBrokerAdapter *broker,
+                    IPerformanceProfiler *profiler,
+                    ILatencyMonitor *latency,
+                    IMemoryStatistics *memory,
+                    IEventStatistics *events,
+                    IQueueStatistics *queues)
+    {
+        m_logger   = logger;
+        m_broker   = broker;
+        m_profiler = profiler;
+        m_latency  = latency;
+        m_memory   = memory;
+        m_events   = events;
+        m_queues   = queues;
+    }
+
+    /**
+     * @brief Clear all borrowed source pointers.
+     *
+     * Called during shutdown BEFORE the source objects (broker, metrics
+     * components) are destroyed. Prevents dangling-pointer access if the
+     * HealthMonitor outlives its sources (e.g. during Bootstrapper teardown).
+     */
+    void ClearSources(void)
+    {
+        m_logger   = NULL;
+        m_broker   = NULL;
+        m_profiler = NULL;
+        m_latency  = NULL;
+        m_memory   = NULL;
+        m_events   = NULL;
+        m_queues   = NULL;
+    }
+
+    /**
+     * @brief Reset error-tracking state.
+     *
+     * Clears the last fatal error, fatal timestamp, and total error count.
+     * Allows the monitor to recover from a RED state without object
+     * destruction (restart-safe).
+     */
+    void Reset(void)
+    {
+        m_last_fatal_error = "";
+        m_last_fatal_time  = 0;
+        m_total_errors     = 0;
+    }
+
+    /**
+     * @brief Set thresholds (optional — defaults are sensible).
+     */
+    void SetThresholds(const double slow_tick_ms,
+                       const double slow_order_ms,
+                       const double high_slippage_points,
+                       const double memory_growth_pct,
+                       const int queue_overflow_limit)
+    {
+        m_slow_tick_ms         = slow_tick_ms;
+        m_slow_order_ms        = slow_order_ms;
+        m_high_slippage_points = high_slippage_points;
+        m_memory_growth_pct    = memory_growth_pct;
+        m_queue_overflow_limit = queue_overflow_limit;
+    }
 
     //=== IHealthMonitor implementation ===
 
-    virtual HealthSnapshot GetSnapshot(void) const override;
-    virtual void ReportFatal(const string message) override;
-    virtual void ReportError(void) override;
-    virtual bool IsHealthy(void) const override;
+    virtual HealthSnapshot GetSnapshot(void) const override
+    {
+        HealthSnapshot snap;
+        ZeroMemory(snap);
+
+        //--- Queue health
+        if(m_events != NULL)
+        {
+            EventStats es;
+            m_events.GetStats(es);
+            snap.total_dropped_events = es.events_dropped;
+            snap.queue_depth          = (int)es.max_queue_depth;
+        }
+
+        //--- Latency
+        if(m_latency != NULL)
+        {
+            snap.avg_pipeline_latency_ms = m_latency.GetAverage(ATLAS_LATENCY_PIPELINE);
+            snap.peak_pipeline_latency_ms = m_latency.GetPeak(ATLAS_LATENCY_PIPELINE);
+            snap.avg_tick_latency_ms      = m_latency.GetAverage(ATLAS_LATENCY_TICK);
+            snap.peak_tick_latency_ms      = m_latency.GetPeak(ATLAS_LATENCY_TICK);
+        }
+
+        //--- Broker connectivity
+        if(m_broker != NULL)
+        {
+            snap.broker_connected = true;
+            snap.trading_enabled   = true;
+            snap.market_open       = true;
+        }
+
+        //--- Memory
+        if(m_memory != NULL)
+        {
+            MemorySnapshot ms = m_memory.GetSnapshot();
+            snap.memory_used_mb = ms.current_memory_mb;
+        }
+
+        //--- Errors
+        snap.last_fatal_error = m_last_fatal_error;
+        snap.last_fatal_time  = m_last_fatal_time;
+        snap.total_errors     = m_total_errors;
+
+        //--- Composite health
+        HealthReport report = GetReport();
+        snap.system_healthy = (report.status == ATLAS_HEALTH_GREEN);
+        snap.health_reason  = report.summary;
+
+        return snap;
+    }
+
+    virtual void ReportFatal(const string message) override
+    {
+        m_last_fatal_error = message;
+        m_last_fatal_time  = TimeCurrent();
+        m_total_errors++;
+        if(m_logger != NULL)
+            m_logger.Fatal("HealthMonitor", "FATAL: " + message);
+    }
+
+    virtual void ReportError(void) override { m_total_errors++; }
+
+    virtual bool IsHealthy(void) const override
+    {
+        return (GetReport().status == ATLAS_HEALTH_GREEN);
+    }
+
+    //=== Extended API ===
+
+    /**
+     * @brief Validate structural invariants of the health monitor.
+     *
+     * Design by contract (v0.1.26.x): verifies that error counters are
+     * non-negative and that the configured thresholds are positive
+     * (zero/negative thresholds would silently disable the related
+     * checks in GetReport()).
+     *
+     * @return ValidationResult::Ok() if all invariants hold,
+     *         ValidationResult::Fail(code, reason, field) otherwise.
+     */
+    ValidationResult Validate(void) const
+    {
+        //--- m_total_errors is ulong — can never be negative in practice,
+        //--- but the cast makes the contract explicit & future-proof.
+        if((long)m_total_errors < 0)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                                          "m_total_errors is negative",
+                                          "m_total_errors");
+
+        if(m_queue_overflow_limit <= 0)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                                          "m_queue_overflow_limit must be > 0",
+                                          "m_queue_overflow_limit");
+
+        if(m_slow_tick_ms <= 0.0)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                                          "m_slow_tick_ms must be > 0",
+                                          "m_slow_tick_ms");
+
+        if(m_slow_order_ms <= 0.0)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                                          "m_slow_order_ms must be > 0",
+                                          "m_slow_order_ms");
+
+        return ValidationResult::Ok();
+    }
+
+    /**
+     * @brief Generate a complete health report.
+     * @return HealthReport with GREEN/YELLOW/RED status and issues.
+     */
+    virtual HealthReport GetReport(void) const override
+    {
+        HealthReport report;
+        report.status      = ATLAS_HEALTH_GREEN;
+        report.issue_count = 0;
+        report.summary     = "All systems nominal";
+
+        report.queue_overflow       = false;
+        report.pipeline_timeout     = false;
+        report.memory_growth        = false;
+        report.snapshot_failure     = false;
+        report.persistence_failure  = false;
+        report.broker_connected     = true;
+        report.recovery_failure     = false;
+        report.slow_tick            = false;
+        report.slow_order           = false;
+        report.high_slippage        = false;
+        report.kill_switch_active   = false;
+
+        //--- Check 1: Fatal error → RED
+        if(m_last_fatal_time > 0)
+        {
+            report.status = ATLAS_HEALTH_RED;
+            AddIssue(report, FATAL_ERROR, "Fatal error: " + m_last_fatal_error, ATLAS_HEALTH_RED);
+        }
+
+        //--- Check 2: Broker disconnect → RED
+        if(m_broker == NULL)
+        {
+            report.broker_connected = false;
+            report.status = ATLAS_HEALTH_RED;
+            AddIssue(report, BROKER_DISCONNECTED, "Broker adapter not connected", ATLAS_HEALTH_RED);
+        }
+
+        //--- Check 3: Queue overflow → RED
+        if(m_events != NULL)
+        {
+            EventStats es;
+            m_events.GetStats(es);
+            if((int)es.max_queue_depth >= m_queue_overflow_limit)
+            {
+                report.queue_overflow = true;
+                report.status = ATLAS_HEALTH_RED;
+                AddIssue(report, QUEUE_OVERFLOW,
+                          "Queue overflow: depth=" + IntegerToString((int)es.max_queue_depth),
+                          ATLAS_HEALTH_RED);
+            }
+            if(es.events_dropped > 0)
+            {
+                report.status = (report.status < ATLAS_HEALTH_YELLOW) ? ATLAS_HEALTH_YELLOW : report.status;
+                AddIssue(report, QUEUE_OVERFLOW,
+                          "Events dropped: " + IntegerToString((long)es.events_dropped),
+                          ATLAS_HEALTH_YELLOW);
+            }
+        }
+
+        //--- Check 4: Slow tick → YELLOW
+        if(m_latency != NULL)
+        {
+            double peak_tick = m_latency.GetPeak(ATLAS_LATENCY_TICK);
+            if(peak_tick > m_slow_tick_ms)
+            {
+                report.slow_tick = true;
+                report.status = (report.status < ATLAS_HEALTH_YELLOW) ? ATLAS_HEALTH_YELLOW : report.status;
+                AddIssue(report, SLOW_TICK,
+                          "Slow tick: " + DoubleToString(peak_tick, 1) + "ms",
+                          ATLAS_HEALTH_YELLOW);
+            }
+
+            double peak_order = m_latency.GetPeak(ATLAS_LATENCY_ORDER);
+            if(peak_order > m_slow_order_ms)
+            {
+                report.slow_order = true;
+                report.status = (report.status < ATLAS_HEALTH_YELLOW) ? ATLAS_HEALTH_YELLOW : report.status;
+                AddIssue(report, SLOW_ORDER,
+                          "Slow order: " + DoubleToString(peak_order, 1) + "ms",
+                          ATLAS_HEALTH_YELLOW);
+            }
+        }
+
+        //--- Check 5: Memory growth → YELLOW
+        if(m_memory != NULL)
+        {
+            MemorySnapshot ms = m_memory.GetSnapshot();
+            if(ms.memory_growth_pct > m_memory_growth_pct)
+            {
+                report.memory_growth = true;
+                report.status = (report.status < ATLAS_HEALTH_YELLOW) ? ATLAS_HEALTH_YELLOW : report.status;
+                AddIssue(report, MEMORY_GROWTH,
+                          "Memory growth: " + DoubleToString(ms.memory_growth_pct, 1) + "%",
+                          ATLAS_HEALTH_YELLOW);
+            }
+        }
+
+        //--- Check 6: Pipeline timeout → YELLOW
+        if(m_profiler != NULL)
+        {
+            for(int i = 0; i < ATLAS_PHASE_COUNT; i++)
+            {
+                PhaseProfile pp;
+                m_profiler.GetProfile(i, pp);
+                if(pp.max_microseconds > (ulong)(m_slow_tick_ms * 1000))
+                {
+                    report.pipeline_timeout = true;
+                    report.status = (report.status < ATLAS_HEALTH_YELLOW) ? ATLAS_HEALTH_YELLOW : report.status;
+                    AddIssue(report, PIPELINE_TIMEOUT,
+                              "Pipeline phase " + IntegerToString(i) + " timeout: " +
+                              IntegerToString((long)pp.max_microseconds) + "us",
+                              ATLAS_HEALTH_YELLOW);
+                    break;
+                }
+            }
+        }
+
+        //--- Build summary
+        if(report.status == ATLAS_HEALTH_GREEN)
+            report.summary = "All systems nominal";
+        else if(report.status == ATLAS_HEALTH_YELLOW)
+            report.summary = "Degraded: " + IntegerToString(report.issue_count) + " warning(s)";
+        else
+            report.summary = "CRITICAL: " + IntegerToString(report.issue_count) + " issue(s)";
+
+        return report;
+    }
+
+    /**
+     * @brief Log the health report.
+     */
+    virtual void LogReport(void) const override
+    {
+        if(m_logger == NULL) return;
+
+        HealthReport report = GetReport();
+        string status_str;
+        switch(report.status)
+        {
+            case ATLAS_HEALTH_GREEN:  status_str = "GREEN";  break;
+            case ATLAS_HEALTH_YELLOW: status_str = "YELLOW"; break;
+            case ATLAS_HEALTH_RED:    status_str = "RED";    break;
+            default:                  status_str = "UNKNOWN"; break;
+        }
+
+        m_logger.Info("HealthMonitor", "=== HEALTH: " + status_str + " ===");
+        m_logger.Info("HealthMonitor", "Summary: " + report.summary);
+
+        for(int i = 0; i < report.issue_count; i++)
+            m_logger.Warn("HealthMonitor", "  Issue: " + report.issues[i].description);
+    }
 };
-
-//+------------------------------------------------------------------+
-//| HealthMonitor implementation                                      |
-//+------------------------------------------------------------------+
-
-HealthMonitor::HealthMonitor(void)
-{
-    m_logger                  = NULL;
-    m_queue                   = NULL;
-    m_stats                   = NULL;
-    m_broker                  = NULL;
-    m_symbol                  = "";
-    m_last_fatal_error        = "";
-    m_last_fatal_time         = 0;
-    m_total_errors            = 0;
-    m_max_queue_depth_warn    = 100;
-    m_max_queue_depth_critical = 400;
-    m_max_tick_latency_ms     = 50.0;
-}
-
-//+------------------------------------------------------------------+
-void HealthMonitor::SetSources(ILogger *logger, EventQueue *queue,
-                               PipelineStatistics *stats, IBrokerAdapter *broker,
-                               const string symbol)
-{
-    m_logger = logger;
-    m_queue  = queue;
-    m_stats  = stats;
-    m_broker = broker;
-    m_symbol = symbol;
-}
-
-//+------------------------------------------------------------------+
-HealthSnapshot HealthMonitor::GetSnapshot(void) const
-{
-    HealthSnapshot snap;
-    ZeroMemory(snap);
-
-    //--- Queue health
-    if(m_queue != NULL)
-    {
-        snap.queue_depth          = m_queue.TotalCount();
-        snap.priority_queue_depth = m_queue.PriorityCount();
-        snap.total_dropped_events = m_queue.TotalDropped();
-    }
-
-    //--- Latency
-    if(m_stats != NULL)
-    {
-        snap.avg_pipeline_latency_ms  = m_stats.AverageTickLatency();
-        snap.peak_pipeline_latency_ms = m_stats.PeakTickLatency();
-        snap.avg_tick_latency_ms      = m_stats.AverageTickLatency();
-        snap.peak_tick_latency_ms     = m_stats.PeakTickLatency();
-    }
-
-    //--- Broker connectivity
-    if(m_broker != NULL)
-    {
-        //--- Broker connectivity is inferred from whether we can get a tick
-        //--- (defensive — actual terminal connection check uses TerminalInfoInteger)
-        snap.broker_connected = true;  //--- If adapter exists, assume connected
-        snap.trading_enabled  = true;
-        snap.market_open      = true;
-    }
-    else
-    {
-        snap.broker_connected = false;
-        snap.trading_enabled  = false;
-        snap.market_open      = false;
-    }
-
-    //--- Memory
-    snap.memory_used_mb = (ulong)MQLInfoInteger(MQL_MEMORY_USED);
-
-    //--- Errors
-    snap.last_fatal_error = m_last_fatal_error;
-    snap.last_fatal_time  = m_last_fatal_time;
-    snap.total_errors     = m_total_errors;
-
-    //--- Composite health
-    ComputeHealth(snap, snap.system_healthy, snap.health_reason);
-
-    return snap;
-}
-
-//+------------------------------------------------------------------+
-void HealthMonitor::ComputeHealth(const HealthSnapshot &snap,
-                                   bool &out_healthy, string &out_reason) const
-{
-    //--- Fatal error present → unhealthy
-    if(snap.last_fatal_time > 0)
-    {
-        out_healthy = false;
-        out_reason  = "fatal_error: " + snap.last_fatal_error;
-        return;
-    }
-
-    //--- Broker not connected → unhealthy
-    if(!snap.broker_connected)
-    {
-        out_healthy = false;
-        out_reason  = "broker_disconnected";
-        return;
-    }
-
-    //--- Trading disabled → unhealthy
-    if(!snap.trading_enabled)
-    {
-        out_healthy = false;
-        out_reason  = "trading_disabled";
-        return;
-    }
-
-    //--- Queue critically full → unhealthy
-    if(snap.queue_depth >= m_max_queue_depth_critical)
-    {
-        out_healthy = false;
-        out_reason  = "queue_overflow: " + IntegerToString(snap.queue_depth);
-        return;
-    }
-
-    //--- Tick latency exceeded → unhealthy
-    if(snap.peak_tick_latency_ms > m_max_tick_latency_ms)
-    {
-        out_healthy = false;
-        out_reason  = "latency_exceeded: " + DoubleToString(snap.peak_tick_latency_ms, 2) + "ms";
-        return;
-    }
-
-    out_healthy = true;
-    out_reason  = "OK";
-}
-
-//+------------------------------------------------------------------+
-void HealthMonitor::ReportFatal(const string message)
-{
-    m_last_fatal_error = message;
-    m_last_fatal_time  = TimeCurrent();
-    m_total_errors++;
-
-    if(m_logger != NULL)
-        m_logger.Fatal("HealthMonitor", "FATAL recorded: " + message);
-}
-
-//+------------------------------------------------------------------+
-void HealthMonitor::ReportError(void)
-{
-    m_total_errors++;
-}
-
-//+------------------------------------------------------------------+
-bool HealthMonitor::IsHealthy(void) const
-{
-    HealthSnapshot snap = GetSnapshot();
-    return snap.system_healthy;
-}
 
 #endif // ATLAS_HEALTH_MONITOR_MQH
 //+------------------------------------------------------------------+

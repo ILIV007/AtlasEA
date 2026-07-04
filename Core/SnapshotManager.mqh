@@ -8,6 +8,7 @@
 #include "../Config/Settings.mqh"
 #include "../Interfaces/IContextStore.mqh"
 #include "../Interfaces/ILogger.mqh"
+#include "ValidationResult.mqh"
 
 /**
  * @class SnapshotManager
@@ -92,6 +93,34 @@ public:
 
     /// @brief Last snapshot persistence time.
     datetime LastSnapshotTime(void) const { return m_last_snapshot_time; }
+
+    /**
+     * @brief Validate snapshot manager integrity.
+     * @return ValidationResult.
+     *
+     * Invariants:
+     *   - m_last_assigned >= 0 (monotonic counter, never negative)
+     *   - m_snapshot_interval_sec > 0
+     *   - if m_context != NULL, m_last_assigned == m_context.GetSnapshotId()
+     *     (the manager and context must agree on the current ID)
+     */
+    ValidationResult Validate(void) const
+    {
+        if(m_last_assigned < 0)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "last_assigned < 0", "last_assigned");
+        if(m_snapshot_interval_sec <= 0)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "snapshot_interval_sec <= 0", "snapshot_interval_sec");
+        if(m_context != NULL)
+        {
+            if(m_context.GetSnapshotId() != m_last_assigned)
+                return ValidationResult::Fail(ATLAS_V_INCONSISTENT,
+                    "context snapshot_id != manager last_assigned",
+                    "snapshot_id");
+        }
+        return ValidationResult::Ok();
+    }
 };
 
 //+------------------------------------------------------------------+

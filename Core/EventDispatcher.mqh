@@ -13,6 +13,7 @@
 #include "EventQueue.mqh"
 #include "TimeBudgetRunner.mqh"
 #include "PipelineStatistics.mqh"
+#include "ValidationResult.mqh"
 
 /**
  * @class EventDispatcher
@@ -45,6 +46,7 @@ public:
         ulong total_duplicates;
         ulong total_filtered;
         ulong total_invalid;
+        ulong total_sequence_gaps;
         ulong per_type_count[13];  // One per ENUM_ATLAS_EVENT_TYPE
     };
 
@@ -54,17 +56,26 @@ private:
     ILogger         *m_logger;          ///< Logger
     DispatchStats    m_stats;           ///< Dispatch statistics
 
-    /// Duplicate detection ring (event_id based, for ExecutionEvents)
-    string m_seen_event_ids[ATLAS_IDEMPOTENCY_SLOTS];
-    int    m_seen_count;
+    /// Duplicate detection ring (numeric composite key — no string allocation)
+    long m_seen_keys[ATLAS_IDEMPOTENCY_SLOTS];
+    int  m_seen_count;
+
+    /// Last seen snapshot_id for sequence continuity checking
+    long m_last_snapshot_id;
+
+    /// @brief Build a numeric composite key from event fields (zero allocation).
+    long BuildCompositeKey(const AtlasEvent &event) const
+    {
+        return (long)event.type * 100000000L + (long)(event.timestamp % 100000);
+    }
 
     /// @brief Validate an event before dispatching.
     bool ValidateEvent(const AtlasEvent &event) const;
 
-    /// @brief Check if an event_id has already been seen (duplicate detection).
+    /// @brief Check if a composite key has already been seen (duplicate detection).
     bool IsDuplicate(const AtlasEvent &event);
 
-    /// @brief Record an event_id in the dedup ring.
+    /// @brief Record a composite key in the dedup ring.
     void RecordSeen(const AtlasEvent &event);
 
 public:
@@ -119,6 +130,7 @@ EventDispatcher::EventDispatcher(void)
     m_context = NULL;
     m_logger  = NULL;
     m_seen_count = 0;
+    m_last_snapshot_id = 0;
     ResetStats();
 }
 
@@ -135,46 +147,29 @@ void EventDispatcher::Initialize(EventQueue *queue, IContextStore *context, ILog
 //+------------------------------------------------------------------+
 bool EventDispatcher::ValidateEvent(const AtlasEvent &event) const
 {
-    //--- Validate event type
-    if(event.type < EV_TICK_RECEIVED || event.type > EV_KILL_SWITCH_ACTIVATED)
+    //--- Delegate to the canonical contract validation method.
+    //    This ensures the dispatcher uses the same invariants as every
+    //    other consumer of AtlasEvent. The struct's Validate() checks
+    //    type range, source_module non-empty, timestamp > 0, and
+    //    payload_size in [0, ATLAS_PAYLOAD_MAX_SIZE].
+    ValidationResult vr = event.Validate();
+    if(!vr.valid)
     {
         if(m_logger != NULL)
-            m_logger.Warn("EventDispatcher", "Invalid event type: " + IntegerToString((int)event.type));
+            m_logger.Warn("EventDispatcher",
+                "Event validation failed: " + vr.Summary());
         return false;
     }
-
-    //--- Validate source module is non-empty
-    if(StringLen(event.source_module) == 0)
-    {
-        if(m_logger != NULL)
-            m_logger.Warn("EventDispatcher", "Event with empty source_module");
-        return false;
-    }
-
-    //--- Validate timestamp
-    if(event.timestamp <= 0)
-    {
-        if(m_logger != NULL)
-            m_logger.Warn("EventDispatcher", "Event with zero timestamp from " + event.source_module);
-        return false;
-    }
-
     return true;
 }
 
 //+------------------------------------------------------------------+
 bool EventDispatcher::IsDuplicate(const AtlasEvent &event)
 {
-    //--- Only dedup ExecutionEvents (they carry a request_id in source_module context)
-    //--- For simplicity, we use (type + timestamp + snapshot_id) as a composite key
-    //--- and only check the last ATLAS_IDEMPOTENCY_SLOTS events
-    string composite = IntegerToString((int)event.type) + "_" +
-                       IntegerToString((long)event.timestamp) + "_" +
-                       IntegerToString(event.snapshot_id);
-
+    long key = BuildCompositeKey(event);
     for(int i = 0; i < m_seen_count; i++)
     {
-        if(m_seen_event_ids[i] == composite)
+        if(m_seen_keys[i] == key)
             return true;
     }
     return false;
@@ -183,19 +178,18 @@ bool EventDispatcher::IsDuplicate(const AtlasEvent &event)
 //+------------------------------------------------------------------+
 void EventDispatcher::RecordSeen(const AtlasEvent &event)
 {
-    string composite = IntegerToString((int)event.type) + "_" +
-                       IntegerToString((long)event.timestamp) + "_" +
-                       IntegerToString(event.snapshot_id);
-
+    long key = BuildCompositeKey(event);
     if(m_seen_count >= ATLAS_IDEMPOTENCY_SLOTS)
     {
         for(int i = 1; i < ATLAS_IDEMPOTENCY_SLOTS; i++)
-            m_seen_event_ids[i-1] = m_seen_event_ids[i];
-        m_seen_count = ATLAS_IDEMPOTENCY_SLOTS - 1;
+            m_seen_keys[i-1] = m_seen_keys[i];
+        m_seen_keys[ATLAS_IDEMPOTENCY_SLOTS - 1] = key;
     }
-
-    m_seen_event_ids[m_seen_count] = composite;
-    m_seen_count++;
+    else
+    {
+        m_seen_keys[m_seen_count] = key;
+        m_seen_count++;
+    }
 }
 
 //+------------------------------------------------------------------+
@@ -236,6 +230,18 @@ int EventDispatcher::ProcessBatch(TimeBudgetRunner *budget, PipelineStatistics *
             m_stats.total_invalid++;
             continue;
         }
+
+        //--- Sequence continuity check (snapshot_id gaps)
+        if(m_last_snapshot_id > 0 && event.snapshot_id > m_last_snapshot_id + 1)
+        {
+            m_stats.total_sequence_gaps++;
+            if(m_logger != NULL)
+                m_logger.Warn("EventDispatcher",
+                    "Snapshot gap: expected " + IntegerToString(m_last_snapshot_id + 1) +
+                    " got " + IntegerToString(event.snapshot_id));
+        }
+        if(event.snapshot_id > m_last_snapshot_id)
+            m_last_snapshot_id = event.snapshot_id;
 
         //--- Duplicate detection
         if(IsDuplicate(event))
@@ -291,6 +297,7 @@ void EventDispatcher::ResetStats(void)
     m_stats.total_duplicates  = 0;
     m_stats.total_filtered    = 0;
     m_stats.total_invalid     = 0;
+    m_stats.total_sequence_gaps = 0;
     for(int i = 0; i < 13; i++)
         m_stats.per_type_count[i] = 0;
 }
@@ -299,6 +306,7 @@ void EventDispatcher::ResetStats(void)
 void EventDispatcher::ResetDedup(void)
 {
     m_seen_count = 0;
+    m_last_snapshot_id = 0;
 }
 
 #endif // ATLAS_EVENT_DISPATCHER_MQH

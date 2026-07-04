@@ -20,6 +20,7 @@
 #include "SnapshotManager.mqh"
 #include "PipelineStatistics.mqh"
 #include "TimeBudgetRunner.mqh"
+#include "ValidationResult.mqh"
 
 /**
  * @class PhaseScheduler
@@ -93,6 +94,48 @@ public:
      * @brief Get the last market state produced by the market phase.
      */
     const MarketState& LastMarketState(void) const { return m_last_market_state; }
+
+    /**
+     * @brief Validate the scheduler's internal state.
+     * @return ValidationResult.
+     *
+     * Invariants:
+     *   - m_context != NULL (required for kill-switch check)
+     *   - m_snapshot_mgr != NULL (required for snapshot ID assignment)
+     *   - m_logger != NULL (required for diagnostics)
+     *   - m_budget != NULL (required for phase timing)
+     *   - m_broker != NULL (required for tick capture)
+     *   - m_last_market_state, if populated (snapshot_id > 0), must validate
+     */
+    ValidationResult Validate(void) const
+    {
+        if(m_context == NULL)
+            return ValidationResult::Fail(ATLAS_V_NOT_INITIALIZED,
+                "context is NULL", "m_context");
+        if(m_snapshot_mgr == NULL)
+            return ValidationResult::Fail(ATLAS_V_NOT_INITIALIZED,
+                "snapshot_mgr is NULL", "m_snapshot_mgr");
+        if(m_logger == NULL)
+            return ValidationResult::Fail(ATLAS_V_NOT_INITIALIZED,
+                "logger is NULL", "m_logger");
+        if(m_budget == NULL)
+            return ValidationResult::Fail(ATLAS_V_NOT_INITIALIZED,
+                "budget is NULL", "m_budget");
+        if(m_broker == NULL)
+            return ValidationResult::Fail(ATLAS_V_NOT_INITIALIZED,
+                "broker is NULL", "m_broker");
+        //--- Validate cached market state if it has been populated
+        if(m_last_market_state.snapshot_id > 0)
+        {
+            ValidationResult mr = m_last_market_state.Validate();
+            if(!mr.valid)
+            {
+                mr.field = "m_last_market_state." + mr.field;
+                return mr;
+            }
+        }
+        return ValidationResult::Ok();
+    }
 };
 
 //+------------------------------------------------------------------+
@@ -155,7 +198,7 @@ void PhaseScheduler::EmitFlowEvent(const ENUM_ATLAS_EVENT_TYPE type, const long 
 AggregatedVote PhaseScheduler::AggregateVotes(const StrategyVote &votes[], const int count, const long snapshot_id) const
 {
     AggregatedVote agg;
-    agg.aggregation_id = "AGG_" + IntegerToString(snapshot_id) + "_" + IntegerToString(MathRand());
+    agg.aggregation_id = "AGG_" + IntegerToString(snapshot_id);
     agg.vote_count     = count;
     agg.snapshot_id    = snapshot_id;
 
@@ -207,12 +250,39 @@ bool PhaseScheduler::RunPipeline(void)
     ulong phase_start = GetTickCount64();
     long snap_id = m_snapshot_mgr.AssignId();
 
-    RawTick tick = m_broker.CaptureTick();
+    //--- Capture tick (null-safe)
+    RawTick tick;
+    if(m_broker != NULL)
+        tick = m_broker.CaptureTick();
+    else
+    {
+        ZeroMemory(tick);
+        tick.timestamp = TimeCurrent();
+    }
     EmitFlowEvent(EV_TICK_RECEIVED, snap_id);
 
     if(m_market != NULL)
     {
         m_last_market_state = m_market.ProcessTick(tick, snap_id);
+
+        //--- Runtime invariant: validate the market state produced by the engine.
+        //    If the engine claims the state is valid but it fails structural
+        //    validation, mark it invalid and log the precise reason. This
+        //    prevents corrupt market data from reaching the strategy phase.
+        if(m_last_market_state.is_valid)
+        {
+            ValidationResult mvalid = m_last_market_state.Validate();
+            if(!mvalid.valid)
+            {
+                if(m_logger != NULL)
+                    m_logger.Warn("PhaseScheduler",
+                        "MarketState invariant violated: " + mvalid.Summary() +
+                        " — marking invalid");
+                m_last_market_state.is_valid = false;
+                m_last_market_state.invalid_reason = mvalid.Summary();
+            }
+        }
+
         EmitFlowEvent(EV_MARKET_STATE_UPDATED, snap_id);
 
         if(m_stats != NULL)
@@ -247,6 +317,23 @@ bool PhaseScheduler::RunPipeline(void)
                 if(m_risk != NULL)
                 {
                     RiskDecision decision = m_risk.EvaluateRisk(agg);
+
+                    //--- Runtime invariant: validate the risk decision before
+                    //    passing it to execution. If invalid, log and skip.
+                    if(decision.status == ATLAS_DECISION_APPROVED)
+                    {
+                        ValidationResult dvalid = decision.Validate();
+                        if(!dvalid.valid)
+                        {
+                            if(m_logger != NULL)
+                                m_logger.Error("PhaseScheduler",
+                                    "RiskDecision invariant violated: " + dvalid.Summary() +
+                                    " — rejecting decision");
+                            decision.status = ATLAS_DECISION_REJECTED;
+                            decision.rejection_reason = "Invariant violation: " + dvalid.Summary();
+                        }
+                    }
+
                     EmitFlowEvent(EV_RISK_DECISION_RENDERED, snap_id);
 
                     if(m_stats != NULL)
@@ -262,13 +349,27 @@ bool PhaseScheduler::RunPipeline(void)
                         OrderRequest req;
                         if(m_execution.BuildOrderRequest(decision, m_last_market_state, req))
                         {
-                            EmitFlowEvent(EV_ORDER_REQUESTED, snap_id);
+                            //--- Runtime invariant: validate the order request
+                            //    before sending to the broker. If invalid, log
+                            //    and skip — never send a corrupt order.
+                            ValidationResult ovalid = req.Validate();
+                            if(!ovalid.valid)
+                            {
+                                if(m_logger != NULL)
+                                    m_logger.Error("PhaseScheduler",
+                                        "OrderRequest invariant violated: " + ovalid.Summary() +
+                                        " — order NOT sent");
+                            }
+                            else
+                            {
+                                EmitFlowEvent(EV_ORDER_REQUESTED, snap_id);
 
-                            bool sent = m_broker.SendOrder(req);
-                            m_context.IncrementOrdersSent();
+                                bool sent = m_broker.SendOrder(req);
+                                m_context.IncrementOrdersSent();
 
-                            if(sent)
-                                EmitFlowEvent(EV_ORDER_DISPATCHED, snap_id);
+                                if(sent)
+                                    EmitFlowEvent(EV_ORDER_DISPATCHED, snap_id);
+                            }
                         }
                     }
                     else if(decision.kill_switch_triggered)

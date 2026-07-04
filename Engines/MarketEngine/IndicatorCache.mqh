@@ -87,6 +87,11 @@ public:
     IndicatorCache(void);
 
     /**
+     * @brief Destructor — releases indicator handles if still held.
+     */
+    ~IndicatorCache(void) { Shutdown(); }
+
+    /**
      * @brief Initialize — create all indicator handles.
      * @param broker Broker adapter.
      * @param logger Logger.
@@ -187,6 +192,10 @@ bool IndicatorCache::SafeCopy(const int handle, const int buf_num, const int shi
 //+------------------------------------------------------------------+
 bool IndicatorCache::Initialize(IBrokerAdapter *broker, ILogger *logger, const AtlasConfig &config)
 {
+    //--- Guard against double-init: release any existing handles first
+    if(m_initialized)
+        Shutdown();
+
     m_broker = broker;
     m_logger = logger;
     m_config = config;
@@ -236,18 +245,21 @@ bool IndicatorCache::Initialize(IBrokerAdapter *broker, ILogger *logger, const A
 //+------------------------------------------------------------------+
 void IndicatorCache::Shutdown(void)
 {
-    if(m_broker != NULL)
-    {
-        if(m_h_atr     != INVALID_HANDLE) { m_broker.ReleaseIndicator(m_h_atr);     m_h_atr     = INVALID_HANDLE; }
-        if(m_h_ma_fast != INVALID_HANDLE) { m_broker.ReleaseIndicator(m_h_ma_fast); m_h_ma_fast = INVALID_HANDLE; }
-        if(m_h_ma_slow != INVALID_HANDLE) { m_broker.ReleaseIndicator(m_h_ma_slow); m_h_ma_slow = INVALID_HANDLE; }
-        if(m_h_rsi     != INVALID_HANDLE) { m_broker.ReleaseIndicator(m_h_rsi);     m_h_rsi     = INVALID_HANDLE; }
-        if(m_h_macd    != INVALID_HANDLE) { m_broker.ReleaseIndicator(m_h_macd);    m_h_macd    = INVALID_HANDLE; }
-        if(m_h_stoch   != INVALID_HANDLE) { m_broker.ReleaseIndicator(m_h_stoch);   m_h_stoch   = INVALID_HANDLE; }
-        if(m_h_cci     != INVALID_HANDLE) { m_broker.ReleaseIndicator(m_h_cci);     m_h_cci     = INVALID_HANDLE; }
-        if(m_h_adx     != INVALID_HANDLE) { m_broker.ReleaseIndicator(m_h_adx);     m_h_adx     = INVALID_HANDLE; }
-        if(m_h_bands   != INVALID_HANDLE) { m_broker.ReleaseIndicator(m_h_bands);   m_h_bands   = INVALID_HANDLE; }
-    }
+    //--- Release all handles directly via IndicatorRelease.
+    //--- We do NOT gate on m_broker != NULL because the broker wrapper
+    //    is a one-line passthrough to IndicatorRelease(). If the broker
+    //    pointer was cleared but handles still exist, we must still release
+    //    them to avoid leaking OS-level indicator resources.
+    if(m_h_atr     != INVALID_HANDLE) { IndicatorRelease(m_h_atr);     m_h_atr     = INVALID_HANDLE; }
+    if(m_h_ma_fast != INVALID_HANDLE) { IndicatorRelease(m_h_ma_fast); m_h_ma_fast = INVALID_HANDLE; }
+    if(m_h_ma_slow != INVALID_HANDLE) { IndicatorRelease(m_h_ma_slow); m_h_ma_slow = INVALID_HANDLE; }
+    if(m_h_rsi     != INVALID_HANDLE) { IndicatorRelease(m_h_rsi);     m_h_rsi     = INVALID_HANDLE; }
+    if(m_h_macd    != INVALID_HANDLE) { IndicatorRelease(m_h_macd);    m_h_macd    = INVALID_HANDLE; }
+    if(m_h_stoch   != INVALID_HANDLE) { IndicatorRelease(m_h_stoch);   m_h_stoch   = INVALID_HANDLE; }
+    if(m_h_cci     != INVALID_HANDLE) { IndicatorRelease(m_h_cci);     m_h_cci     = INVALID_HANDLE; }
+    if(m_h_adx     != INVALID_HANDLE) { IndicatorRelease(m_h_adx);     m_h_adx     = INVALID_HANDLE; }
+    if(m_h_bands   != INVALID_HANDLE) { IndicatorRelease(m_h_bands);   m_h_bands   = INVALID_HANDLE; }
+
     m_initialized = false;
     m_cache_valid = false;
 }

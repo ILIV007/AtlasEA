@@ -8,6 +8,7 @@
 #include "../Config/Settings.mqh"
 #include "../Contracts/Events.mqh"
 #include "../Interfaces/ILogger.mqh"
+#include "ValidationResult.mqh"
 
 /**
  * @class RingBuffer
@@ -74,6 +75,9 @@ public:
     /// @brief Current number of elements in the buffer.
     int    Count(void)        const { return m_count; }
 
+    /// @brief Maximum capacity of the buffer.
+    int    Capacity(void)     const { return m_capacity; }
+
     /// @brief true if the buffer is empty.
     bool   IsEmpty(void)      const { return m_count == 0; }
 
@@ -97,6 +101,64 @@ public:
 
     /// @brief Current utilization as a fraction [0.0, 1.0].
     double Utilization(void)   const { return (m_capacity > 0) ? (double)m_count / (double)m_capacity : 0.0; }
+
+    /**
+     * @brief Validate ring buffer integrity.
+     * @return ValidationResult.
+     *
+     * Invariants:
+     *   - capacity in [1, ATLAS_EVENT_QUEUE_SIZE]
+     *   - count in [0, capacity]
+     *   - head in [0, capacity)
+     *   - tail in [0, capacity)
+     *   - if count == 0, head == tail (empty)
+     *   - if count == capacity, head == tail (full) — distinguished by count
+     *   - all lifetime counters non-negative
+     */
+    ValidationResult Validate(void) const
+    {
+        if(m_capacity < 1 || m_capacity > ATLAS_EVENT_QUEUE_SIZE)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "capacity out of range", "capacity");
+        if(m_count < 0 || m_count > m_capacity)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "count out of range", "count");
+        if(m_head < 0 || m_head >= m_capacity)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "head index out of range", "head");
+        if(m_tail < 0 || m_tail >= m_capacity)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "tail index out of range", "tail");
+        //--- Empty invariant: head == tail when count == 0
+        if(m_count == 0 && m_head != m_tail)
+            return ValidationResult::Fail(ATLAS_V_INCONSISTENT,
+                "count=0 but head!=tail", "head/tail");
+        //--- Full invariant: head == tail when count == capacity
+        if(m_count == m_capacity && m_head != m_tail)
+            return ValidationResult::Fail(ATLAS_V_INCONSISTENT,
+                "count=capacity but head!=tail", "head/tail");
+        //--- Count consistency: (head - tail) mod capacity == count (when not empty/full)
+        if(m_count > 0 && m_count < m_capacity)
+        {
+            int expected = (m_head - m_tail + m_capacity) % m_capacity;
+            if(expected != m_count)
+                return ValidationResult::Fail(ATLAS_V_INCONSISTENT,
+                    "head-tail does not match count", "head/tail/count");
+        }
+        if(m_total_enqueued < 0)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "total_enqueued < 0", "total_enqueued");
+        if(m_total_dequeued < 0)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "total_dequeued < 0", "total_dequeued");
+        if(m_total_dropped < 0)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "total_dropped < 0", "total_dropped");
+        if(m_peak_depth < 0)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "peak_depth < 0", "peak_depth");
+        return ValidationResult::Ok();
+    }
 };
 
 //+------------------------------------------------------------------+

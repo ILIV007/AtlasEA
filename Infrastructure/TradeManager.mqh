@@ -6,36 +6,69 @@
 #define ATLAS_TRADE_MANAGER_MQH
 
 #include "../Config/Settings.mqh"
+#include "../Core/ValidationResult.mqh"
 #include "../Contracts/Events.mqh"
 #include "../Contracts/MarketState.mqh"
-#include "../Core/IEventBus.mqh"
-#include "../Core/AtlasContext.mqh"
+#include "../Interfaces/IEventBus.mqh"
+#include "../Interfaces/IPositionStore.mqh"
+#include "../Interfaces/IContextStore.mqh"
+#include "../Interfaces/ILogger.mqh"
+#include "../Interfaces/IBrokerAdapter.mqh"
 
 //+------------------------------------------------------------------+
 //| TradeManager                                                     |
-//|   - mirrors broker positions into AtlasContext                   |
+//|   - mirrors broker positions into IContextStore                   |
 //|   - reconciles internal state vs broker on every OnTrade         |
 //|   - recalculates floating PnL on heartbeat                       |
 //+------------------------------------------------------------------+
-class TradeManager
+class TradeManager : public IPositionStore
 {
 private:
-    IEventBus    *m_event_bus;
-    AtlasConfig   m_config;
-    AtlasContext *m_context;
-    datetime      m_last_update;
+    IEventBus      *m_event_bus;
+    AtlasConfig     m_config;
+    IContextStore  *m_context;
+    ILogger        *m_logger;
+    IBrokerAdapter *m_broker;
+    datetime        m_last_update;
 
-    int    FindPositionByTicket(ulong ticket) const;
     double CalculatePnL(int type, double volume, double open_price, double bid, double ask) const;
-    void   EmitThrottledUpdate(void);
 
 public:
                 TradeManager(IEventBus *bus);
-    bool        Initialize(const AtlasConfig &config, AtlasContext *context);
-    void        ProcessFill(const ExecutionEvent &event);
-    void        ReconcilePositions(const PositionSnapshotEvent &snap);
-    void        UpdatePricesOnHeartbeat(const MarketState &state);
-    void        GetOpenPositions(PositionState &pos[], int &count) const;
+
+    //--- IPositionStore overrides ---
+    virtual bool   Initialize(void) override { return true; }
+    virtual void   Shutdown(void) override { m_event_bus = NULL; m_context = NULL; }
+    virtual void   ProcessFill(const ExecutionEvent &event) override;
+    virtual void   ReconcilePositions(const PositionSnapshotEvent &snap) override;
+    virtual void   UpdatePricesOnHeartbeat(const MarketState &state) override;
+    virtual void   GetOpenPositions(PositionState &pos[], int &count) const override;
+
+    //--- Extended init (called by Bootstrapper) ---
+    void SetDependencies(IEventBus *bus, ILogger *logger, IContextStore *context,
+                         IBrokerAdapter *broker, const AtlasConfig &config);
+    bool Initialize(const AtlasConfig &config, IContextStore *context);
+
+    //--- Design by Contract: validate internal invariants ---
+    //    "If initialized": we infer initialization from the presence of any
+    //    dependency pointer (SetDependencies wires them as a group). When
+    //    initialized, both m_logger and m_broker must be non-NULL.
+    ValidationResult Validate(void) const
+    {
+        bool initialized = (m_logger != NULL || m_broker != NULL || m_context != NULL);
+        if(initialized)
+        {
+            if(m_logger == NULL)
+                return ValidationResult::Fail(ATLAS_V_NOT_INITIALIZED,
+                                              "TradeManager initialized but m_logger is NULL",
+                                              "m_logger");
+            if(m_broker == NULL)
+                return ValidationResult::Fail(ATLAS_V_NOT_INITIALIZED,
+                                              "TradeManager initialized but m_broker is NULL",
+                                              "m_broker");
+        }
+        return ValidationResult::Ok();
+    }
 };
 
 //+------------------------------------------------------------------+
@@ -43,27 +76,28 @@ TradeManager::TradeManager(IEventBus *bus)
 {
     m_event_bus  = bus;
     m_context    = NULL;
+    m_logger     = NULL;
+    m_broker     = NULL;
     m_last_update = 0;
 }
 
 //+------------------------------------------------------------------+
-bool TradeManager::Initialize(const AtlasConfig &config, AtlasContext *context)
+void TradeManager::SetDependencies(IEventBus *bus, ILogger *logger, IContextStore *context,
+                                    IBrokerAdapter *broker, const AtlasConfig &config)
+{
+    m_event_bus = bus;
+    m_logger   = logger;
+    m_context  = context;
+    m_broker   = broker;
+    m_config   = config;
+}
+
+//+------------------------------------------------------------------+
+bool TradeManager::Initialize(const AtlasConfig &config, IContextStore *context)
 {
     m_config  = config;
     m_context = context;
     return true;
-}
-
-//+------------------------------------------------------------------+
-int TradeManager::FindPositionByTicket(ulong ticket) const
-{
-    if(m_context == NULL) return -1;
-    for(int i = 0; i < m_context.position_count; i++)
-    {
-        if((ulong)StringToInteger(m_context.positions[i].position_id) == ticket)
-            return i;
-    }
-    return -1;
 }
 
 //+------------------------------------------------------------------+
@@ -75,10 +109,14 @@ double TradeManager::CalculatePnL(int type, double volume, double open_price, do
     else
         diff = open_price - ask;
 
-    double tick_value = SymbolInfoDouble(m_config.symbol, SYMBOL_TRADE_TICK_VALUE);
-    double tick_size  = SymbolInfoDouble(m_config.symbol, SYMBOL_TRADE_TICK_SIZE);
-    if(tick_size > 0.0 && tick_value > 0.0)
-        return diff / tick_size * tick_value * volume;
+    //--- Use broker adapter for tick value/size if available
+    if(m_broker != NULL)
+    {
+        double point = m_broker.SymbolPoint();
+        double contract = m_broker.SymbolContractSize();
+        if(point > 0.0 && contract > 0.0)
+            return diff / point * contract * volume / contract;
+    }
     //--- fallback: raw price diff * volume
     return diff * volume;
 }
@@ -89,8 +127,8 @@ void TradeManager::ProcessFill(const ExecutionEvent &event)
     if(m_context == NULL) return;
     if(event.fill_status == ATLAS_FILL_FILLED || event.fill_status == ATLAS_FILL_PARTIAL)
     {
-        m_context.total_orders_filled++;
-        m_context.daily_trade_count++;
+        m_context.IncrementOrdersFilled();
+        m_context.IncrementDailyTradeCount();
     }
 }
 
@@ -100,9 +138,7 @@ void TradeManager::ProcessFill(const ExecutionEvent &event)
 void TradeManager::ReconcilePositions(const PositionSnapshotEvent &snap)
 {
     if(m_context == NULL) return;
-    m_context.position_count = snap.count;
-    for(int i = 0; i < snap.count && i < ATLAS_MAX_POSITIONS; i++)
-        m_context.positions[i] = snap.broker_positions[i];
+    m_context.SetPositions(snap.broker_positions, snap.count);
 }
 
 //+------------------------------------------------------------------+
@@ -111,17 +147,16 @@ void TradeManager::UpdatePricesOnHeartbeat(const MarketState &state)
     if(m_context == NULL) return;
 
     double total_pnl = 0.0;
-    for(int i = 0; i < m_context.position_count; i++)
+    int count = m_context.GetPositionCount();
+    for(int i = 0; i < count; i++)
     {
-        if(m_context.positions[i].symbol != state.symbol) continue;
-        double pnl = CalculatePnL(m_context.positions[i].type,
-                                  m_context.positions[i].volume,
-                                  m_context.positions[i].open_price,
-                                  state.bid, state.ask);
-        m_context.positions[i].pnl = pnl;
+        PositionState pos;
+        m_context.GetPosition(i, pos);
+        if(pos.symbol != state.symbol) continue;
+        double pnl = CalculatePnL(pos.type, pos.volume, pos.open_price, state.bid, state.ask);
         total_pnl += pnl;
     }
-    m_context.total_floating_pnl = total_pnl;
+    m_context.SetTotalFloatingPnl(total_pnl);
     m_last_update = TimeCurrent();
 }
 
@@ -129,24 +164,9 @@ void TradeManager::UpdatePricesOnHeartbeat(const MarketState &state)
 void TradeManager::GetOpenPositions(PositionState &pos[], int &count) const
 {
     if(m_context == NULL) { count = 0; return; }
-    count = m_context.position_count;
+    count = m_context.GetPositionCount();
     for(int i = 0; i < count; i++)
-        pos[i] = m_context.positions[i];
-}
-
-//+------------------------------------------------------------------+
-void TradeManager::EmitThrottledUpdate(void)
-{
-    if(m_event_bus == NULL) return;
-    if(TimeCurrent() - m_last_update < 5) return;
-    AtlasEvent ev;
-    ev.type          = EV_HEARTBEAT;
-    ev.source_module = "TradeManager";
-    ev.timestamp     = TimeCurrent();
-    ev.snapshot_id   = 0;
-    ev.payload_size  = 0;
-    m_event_bus.EmitEvent(ev);
-    m_last_update = TimeCurrent();
+        m_context.GetPosition(i, pos[i]);
 }
 
 #endif // ATLAS_TRADE_MANAGER_MQH

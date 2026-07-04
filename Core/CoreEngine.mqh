@@ -433,8 +433,10 @@ void CoreEngine::Shutdown(const int reason)
     //--- Final snapshot
     if(m_persistence != NULL)
     {
-        m_persistence.WriteSnapshot(m_context, m_snapshot_mgr.CurrentId());
-        m_persistence.FlushEventBuffer();
+        if(!m_persistence.WriteSnapshot(m_context, m_snapshot_mgr.CurrentId()))
+            m_logger.Warn("CoreEngine", "Final snapshot write FAILED on shutdown");
+        if(!m_persistence.FlushEventBuffer())
+            m_logger.Warn("CoreEngine", "Event log flush FAILED on shutdown");
     }
 
     //--- Kill timer
@@ -494,6 +496,10 @@ void CoreEngine::OnTrade(void)
     {
         PositionSnapshotEvent snap = m_broker_adapter.QueryBrokerPositions();
         m_trade_manager.ReconcilePositions(snap);
+
+        //--- Update risk state after position change
+        if(m_risk_engine != NULL)
+            m_risk_engine.UpdateExposure();
     }
 
     //--- Emit trade event
@@ -534,6 +540,10 @@ void CoreEngine::OnTimer(void)
         {
             m_snapshot_mgr.MarkSnapshotPersisted(now);
             EmitSimpleEvent(EV_STATE_PERSISTED, "CoreEngine", m_snapshot_mgr.CurrentId());
+        }
+        else
+        {
+            m_logger.Warn("CoreEngine", "Snapshot write FAILED — will retry next heartbeat");
         }
     }
 

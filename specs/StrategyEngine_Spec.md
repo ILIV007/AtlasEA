@@ -1,665 +1,404 @@
-# AtlasEA v1.0 — Strategy Engine Production Specification
+# AtlasEA v1.0 — Strategy Engine & Framework Production Specification
 
-**Document version:** 1.0
-**Target module:** `Engines/StrategyEngine.mqh` (+ internal helpers under `Engines/StrategyEngine/`)
-**Interface implemented:** `IStrategySet` (defined in `Interfaces/IStrategySet.mqh`)
-**Contracts consumed:** `MarketState` (from `Contracts/MarketState.mqh`), `StrategyVote` (from `Contracts/RiskDecision.mqh`)
-**Constants available:** `ATLAS_MAX_STRATEGIES = 8`, `ATLAS_MAX_VOTES = 16`, `ATLAS_FEATURE_SIZE = 32`, `ATLAS_ORDER_BUY = 1`, `ATLAS_ORDER_SELL = -1`, `ATLAS_ORDER_NONE = 0`, `ATLAS_MIN_CONFIDENCE = 0.30`, `ATLAS_LOG_*` levels
-
----
-
-# 1. Strategy Engine Responsibilities
-
-The Strategy Engine is the **decision-proposing layer** of AtlasEA. It never executes trades, never queries the broker, never touches account state, and never mutates shared context. Its sole output is a set of `StrategyVote` structs that the Core Engine's `VoteAggregator` merges into an `AggregatedVote` for the Risk Engine.
-
-### R1.1 — MarketState Validation
-
-| Attribute | Value |
-|-----------|-------|
-| **Purpose** | Reject invalid or stale market states before any strategy executes. |
-| **Owner** | `StrategyEngine` (entry point of `EvaluateStrategies`) |
-| **Inputs** | `const MarketState &state` |
-| **Outputs** | Boolean: proceed or abort (abort → return 0 votes) |
-| **Failure handling** | On invalid state, return 0 immediately. Log WARN with `invalid_reason`. |
-| **Performance constraints** | O(1), ≤ 0.05 ms. |
-| **Forbidden behaviors** | Must NOT call `state.features[i]` before checking `state.is_valid`. Must NOT modify the state. Must NOT call any broker/account/position API. |
-
-Validation checks (fail-fast): `is_valid`, `snapshot_id > 0`, `feature_count == 32`, `atr_14 > 0`, `timestamp > 0`, `symbol` non-empty.
-
-### R1.2 — Snapshot Validation
-
-| Attribute | Value |
-|-----------|-------|
-| **Purpose** | Ensure strategies evaluate against a valid snapshot. |
-| **Owner** | `StrategyEngine` |
-| **Inputs** | `state.snapshot_id` |
-| **Outputs** | Boolean |
-| **Failure handling** | Reject if ≤ 0. |
-| **Forbidden behaviors** | Must NOT cache snapshot_id across ticks. |
-
-### R1.3 — Strategy Execution
-
-| Attribute | Value |
-|-----------|-------|
-| **Purpose** | Run each enabled strategy and collect raw votes. |
-| **Owner** | `StrategyRunner` (internal) |
-| **Inputs** | Validated `MarketState`, enabled `StrategyEntry` descriptors |
-| **Outputs** | Array of `StrategyVote` (0..ATLAS_MAX_VOTES) |
-| **Failure handling** | Per-strategy isolation: invalid output → skip, increment failure counter, continue. |
-| **Performance constraints** | Total ≤ 2 ms. Per-strategy: 0.25 ms. |
-| **Forbidden behaviors** | Must NOT share mutable state between strategies. |
-
-### R1.4 — Vote Normalization
-
-| Attribute | Value |
-|-----------|-------|
-| **Purpose** | Clamp and sanitize every vote field. |
-| **Owner** | `VoteValidator` (internal) |
-| **Inputs** | Raw `StrategyVote` |
-| **Outputs** | Validated vote or rejection |
-| **Failure handling** | Discard invalid votes silently. |
-| **Performance constraints** | O(1) per vote |
-
-### R1.5 — Vote Collection & Return
-
-| Attribute | Value |
-|-----------|-------|
-| **Purpose** | Collect validated votes into caller-provided array. |
-| **Owner** | `StrategyEngine` |
-| **Inputs** | Caller-allocated `StrategyVote &votes[]` |
-| **Outputs** | Vote count (0..ATLAS_MAX_VOTES) |
-| **Failure handling** | Truncate if array too small. Log WARN. |
-| **Performance constraints** | O(N), N ≤ ATLAS_MAX_VOTES |
-
-### R1.6 — Metrics Collection
-
-| Attribute | Value |
-|-----------|-------|
-| **Purpose** | Track per-strategy and aggregate statistics. |
-| **Owner** | `StrategyStatistics` (internal) |
-| **Inputs** | Per-evaluation: strategy_id, execution time, result |
-| **Performance constraints** | O(1) per update |
-
-### R1.7 — Kill Switch Awareness
-
-| Attribute | Value |
-|-----------|-------|
-| **Purpose** | Skip all evaluation if kill switch is active. |
-| **Owner** | `StrategyEngine` |
-| **Inputs** | `IContextStore::IsKillSwitchActive()` |
-| **Outputs** | 0 votes if active |
-| **Performance constraints** | O(1), checked first |
-
-### R1.8 — Fast Market Awareness
-
-| Attribute | Value |
-|-----------|-------|
-| **Purpose** | Per-strategy decision (NOT a global skip). |
-| **Owner** | Individual strategies |
-| **Forbidden behaviors** | Engine must NOT globally skip on fast market. |
+**Document version:** 2.0 (updated v0.1.10.0)
+**Target module:** `Engines/StrategyEngine.mqh` (+ `Engines/StrategyFramework/`)
+**Interface implemented:** `IStrategySet`
+**Contracts consumed:** `MarketState`, `StrategyVote`
 
 ---
 
-# 2. Internal Components
+# 1. Architecture Overview
 
-### 2.1 — StrategyRegistry
+The Strategy Engine is now a **pluggable framework**. No trading strategies are hardcoded. Instead, the framework provides:
 
-| Attribute | Value |
-|-----------|-------|
-| **Responsibilities** | Store registered strategy descriptors. Lookup. Uniqueness. Max count. |
-| **Owned data** | `StrategyEntry[ATLAS_MAX_STRATEGIES]`, count |
-| **Public API** | `Register()`, `Unregister()`, `Find()`, `Count()`, `Reset()`, `GetEnabled()` |
-| **Private helpers** | `FindIndex()` |
-| **Dependencies** | `StrategyEntry` struct, `ATLAS_MAX_STRATEGIES` |
-| **Failure modes** | Full → false. Duplicate → false. |
+- `IStrategy` — interface every strategy implements
+- `StrategyMetadata` — immutable descriptor
+- `StrategyContext` — read-only context (MarketState + Config + Logger only)
+- `StrategyRegistry` — registration, lookup, enable/disable
+- `VoteBuilder` — validated vote construction
+- `StrategyExecutor` — isolated execution with failure handling
+- `StrategyEngine` — thin adapter implementing `IStrategySet`
 
-### 2.2 — StrategyRunner
-
-| Attribute | Value |
-|-----------|-------|
-| **Responsibilities** | Execute a single strategy. Isolate failures. |
-| **Owned data** | None |
-| **Public API** | `Run(entry, state, out_vote, out_elapsed_ms)` |
-| **Private helpers** | `ValidateOutput()`, `BuildAbstainVote()` |
-| **Failure modes** | NaN → discard. Invalid direction → discard. |
-
-### 2.3 — VoteValidator
-
-| Attribute | Value |
-|-----------|-------|
-| **Responsibilities** | Validate and normalize a raw vote. |
-| **Public API** | `Validate(in, out, out_reason)` |
-| **Private helpers** | `IsValidDirection()`, `IsValidConfidence()`, `IsValidPrice()`, `Clamp()` |
-
-### 2.4 — ConfidenceNormalizer
-
-| Attribute | Value |
-|-----------|-------|
-| **Responsibilities** | Apply weight, clamp [0,1]. |
-| **Public API** | `Normalize(raw_confidence, weight)` |
-
-### 2.5 — StrategyStatistics
-
-| Attribute | Value |
-|-----------|-------|
-| **Responsibilities** | Track per-strategy metrics. |
-| **Owned data** | `StrategyStatEntry[ATLAS_MAX_STRATEGIES]` |
-| **Public API** | `RecordEvaluation()`, `Reset()`, `GetStats()`, `LogSummary()` |
-
-### 2.6 — StrategyEngine (main)
-
-| Attribute | Value |
-|-----------|-------|
-| **Responsibilities** | Implement `IStrategySet`. Orchestrate pipeline. |
-| **Owned data** | All 5 internal components + logger + config + context |
-| **Public API** | `SetDependencies()`, `EvaluateStrategies()`, `Initialize()`, `Shutdown()`, `RegisterStrategy()`, `LogDiagnostics()` |
+```
+┌─────────────────────────────────────────────────────┐
+│                   CoreEngine                        │
+│                (IStrategySet consumer)              │
+└──────────────────────┬──────────────────────────────┘
+                       │ EvaluateStrategies()
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│                  StrategyEngine                     │
+│            (implements IStrategySet)                │
+├─────────────────────────────────────────────────────┤
+│  StrategyRegistry  ──→  StrategyExecutor            │
+│                          │                          │
+│                          ├─ VoteBuilder             │
+│                          ├─ StrategyContext         │
+│                          └─ IStrategy[] (iterate)   │
+└─────────────────────────────────────────────────────┘
+                       │ Evaluate()
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│              IStrategy (pluggable)                  │
+│   ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐              │
+│   │Strat1│ │Strat2│ │Strat3│ │StratN│              │
+│   └──────┘ └──────┘ └──────┘ └──────┘              │
+└─────────────────────────────────────────────────────┘
+```
 
 ---
 
-# 3. Strategy Lifecycle
+# 2. IStrategy Interface
 
-### 3.1 — Initialization
-1. `SetDependencies(logger, context, config)` called before `Initialize()`.
-2. `Initialize()` validates logger != NULL.
-3. Resets registry, registers built-in strategies, resets stats.
-4. Sets `m_initialized = true`.
+Every strategy must implement:
 
-### 3.2 — Registration
-- `RegisterStrategy(entry)` → `Registry.Register()` validates capacity, duplicate, valid ID.
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `Initialize` | `bool Initialize(const AtlasConfig &config)` | Called once at startup |
+| `Shutdown` | `void Shutdown(void)` | Called at EA shutdown |
+| `GetMetadata` | `const StrategyMetadata& GetMetadata() const` | Return strategy descriptor |
+| `Evaluate` | `bool Evaluate(const StrategyContext &ctx, StrategyVote &vote)` | Produce a vote |
+| `IsEnabled` | `bool IsEnabled() const` | Check if strategy is active |
+| `Reset` | `void Reset(void)` | Reset internal state |
 
-### 3.3 — Loading
-- Identical to registration (no dynamic loading in this phase).
+### Error Contract
 
-### 3.4 — Enable / Disable
-- `StrategyEntry.enabled` field. Runtime mutation. No re-init needed.
+- Return `false` from `Evaluate()` → executor treats as failure, logs, substitutes neutral vote, continues
+- Return `ATLAS_ORDER_NONE` → abstention (not a failure)
+- Return invalid vote (NaN, bad direction) → `VoteBuilder.Validate()` catches it
 
-### 3.5 — Evaluation
-- See Section 6.
+### Forbidden Behaviors
 
-### 3.6 — Vote Generation
-- Directional vote (BUY/SELL, confidence > 0) or abstention (NONE, 0).
-
-### 3.7 — Vote Validation
-- See `VoteValidator` component.
-
-### 3.8 — Cleanup
-- No per-tick cleanup. Fixed-size arrays.
-
-### 3.9 — Shutdown
-1. Log stats summary.
-2. Reset registry.
-3. Set `m_initialized = false`.
-
-### 3.10 — Recovery
-- Stateless across sessions. No persistence. Re-registers on restart.
+A strategy MUST NOT:
+- Call `OrderSend`, `SymbolInfo*`, `AccountInfo*`, `PositionGet*`
+- Access `IBrokerAdapter`
+- Access `IContextStore` (no positions, no risk state)
+- Access `IEventBus` (cannot emit events)
+- Communicate with other strategies
+- Use static mutable variables
+- Allocate memory in `Evaluate()`
 
 ---
 
-# 4. Strategy Interface
+# 3. StrategyMetadata
 
-### 4.1 — Class: `IStrategy`
+| Field | Type | Range | Description |
+|-------|------|-------|-------------|
+| `strategy_id` | int | > 0 | Unique ID |
+| `name` | string | ≤ 32 chars | Human-readable name |
+| `version` | string | ≤ 16 chars | Version string |
+| `author` | string | ≤ 32 chars | Author name |
+| `description` | string | ≤ 128 chars | Description |
+| `required_features` | int[32] | 0/1 | Bitmask of features used |
+| `supported_symbols` | string | "*" or list | Symbol filter |
+| `priority` | int | ≥ 0 | Lower = executed first |
+| `weight` | double | [0.1, 2.0] | Confidence multiplier |
+| `enabled` | bool | true/false | Runtime flag |
+| `category` | int | enum | Trend/Reversion/Momentum/etc. |
 
-| Method | Signature |
-|--------|-----------|
-| `Evaluate` | `virtual StrategyVote Evaluate(const MarketState &state) = 0` |
-| `GetId` | `virtual int GetId() const = 0` |
-| `GetName` | `virtual string GetName() const = 0` |
-| `GetVersion` | `virtual string GetVersion() const = 0` |
-| `GetWeight` | `virtual double GetWeight() const = 0` |
-| `Initialize` | `virtual bool Initialize(const AtlasConfig &config) = 0` |
-| `Shutdown` | `virtual void Shutdown() = 0` |
+### Validation
 
-### 4.2 — Inputs
-- `MarketState` (pre-validated), `AtlasConfig` (trusted)
-
-### 4.3 — Outputs
-- `StrategyVote` (post-validated by VoteValidator)
-
-### 4.4 — Error Codes
-- No error codes. Abstention = `direction=NONE, confidence=0`. Invalid output = discarded.
-
-### 4.5 — Validation Rules (Strategy-side)
-- Read only from `MarketState`. No broker APIs. No `Print()`. No `new`. No modification of state. ≤ 0.25 ms.
-
-### 4.6 — Versioning
-- `GetVersion()` stamped onto every vote.
+- `strategy_id > 0`
+- `name` non-empty, ≤ 32 chars
+- `version` non-empty
+- `weight` in [0.1, 2.0]
+- `priority >= 0`
 
 ---
 
-# 5. Strategy Registry
+# 4. StrategyContext
 
-### 5.1 — Registration Process
-- Validate `entry.strategy_id > 0`, unique, capacity available.
+Read-only context passed to `Evaluate()`. Contains ONLY:
 
-### 5.2 — Duplicate Prevention
-- Duplicate ID → reject. Duplicate name → allowed (logged DEBUG).
+| Field | Type | Access |
+|-------|------|--------|
+| MarketState | `const MarketState*` | Read-only |
+| AtlasConfig | `const AtlasConfig*` | Read-only |
+| ILogger | `ILogger*` | May be NULL |
+| Snapshot ID | `long` | Read-only |
 
-### 5.3 — Priority
-- `priority` field (int, lower = higher priority). Evaluated in priority order.
+### Does NOT Contain
 
-### 5.4 — Weights
-- `weight` field [0.1, 2.0], default 1.0. Applied to confidence.
+- PositionState
+- RiskState
+- IBrokerAdapter
+- Account info
+- Event bus
 
-### 5.5 — Tags
-- `tags` string (informational only in this phase).
+### Convenience Accessors
 
-### 5.6 — Categories
-- `category` enum (TREND, REVERSION, MOMENTUM, BREAKOUT, CUSTOM).
-
-### 5.7 — Hot Reload Policy
-- No hot reload. Enable/disable only runtime mutation.
-
-### 5.8 — Maximum Strategies
-- `ATLAS_MAX_STRATEGIES = 8` (compile-time).
-
-### 5.9 — Disabled Strategies
-- Remain registered, skipped during evaluation.
-
-### 5.10 — Strategy Versioning
-- Version stored in `StrategyEntry`, stamped on every vote.
+- `GetMidPrice()` → (bid + ask) / 2
+- `GetATR()` → state.atr_14
+- `GetFeature(index)` → state.features[index]
+- `GetSession()` → state.session_state
+- `GetTrendDirection()` → state.trend_direction
+- `GetTrendStrength()` → state.trend_strength
 
 ---
 
-# 6. Evaluation Pipeline
+# 5. StrategyRegistry
 
-### Stage 1 — MarketState Validation
-- Check `is_valid`, `snapshot_id`, `feature_count`, `atr_14`, `timestamp`, `symbol`.
+### Responsibilities
 
-### Stage 2 — Snapshot Validation
-- Check `snapshot_id > 0`.
+- `Register(strategy)` — add a strategy (prevents duplicates, null, full)
+- `Unregister(id)` — remove by ID
+- `Enable(id)` / `Disable(id)` — runtime toggle
+- `Find(id)` — lookup by ID
+- `GetAll(out[], count)` — all registered
+- `GetEnabledSorted(out[], count)` — enabled, sorted by priority
+- `ValidateId(id)` — check ID is valid and unique
+- `Clear()` — remove all
 
-### Stage 3 — Kill Switch Check
-- If active: return 0.
+### Capacity
 
-### Stage 4 — Context Preparation
-- None needed (strategies receive MarketState directly).
+- Maximum: `ATLAS_MAX_STRATEGIES = 8` (compile-time)
+- Memory: 8 pointers + counter = ~72 bytes
 
-### Stage 5 — Strategy Execution
-- `GetEnabled()` → iterate in priority order → `Run()` each.
+### Duplicate Prevention
 
-### Stage 6 — Vote Normalization
-- Apply weight inside `StrategyRunner.Run()`.
-
-### Stage 7 — Vote Validation
-- `VoteValidator.Validate()` → discard invalid.
-
-### Stage 8 — Result Collection
-- Copy to caller array. Cap at `ATLAS_MAX_VOTES`.
-
-### Stage 9 — Timeout Handling
-- Per-strategy: 0.25 ms soft limit (logged). Total: CoreEngine budget.
-
-### Stage 10 — Failure Isolation
-- Per-strategy failures do NOT affect others.
-
-### Stage 11 — Statistics Update
-- O(1) counter increments.
-
-### Stage 12 — Return to Core Engine
-- Return vote count.
+- Duplicate `strategy_id` → rejected
+- NULL pointer → rejected
+- Invalid metadata → rejected
 
 ---
 
-# 7. StrategyVote Specification
+# 6. VoteBuilder
 
-### Field: `strategy_id`
-- **Meaning:** Unique strategy identifier.
-- **Type:** `int`
-- **Range:** 1 to INT_MAX.
-- **Validation:** > 0, must exist in registry.
-- **Default:** 0 (invalid).
-- **Immutability:** Immutable after validation.
+The only way to construct a `StrategyVote`. Validates and normalizes:
 
-### Field: `strategy_version`
-- **Meaning:** Strategy version string.
-- **Type:** `string`
-- **Range:** Non-empty, max 16 chars.
-- **Validation:** `StringLen > 0`.
-- **Default:** "" (invalid).
+- Confidence: clamped to [0, 1], multiplied by weight, clamped again
+- Direction: must be BUY, SELL, or NONE
+- Prices: NaN/INF/negative → 0.0
+- Snapshot ID: must be > 0
 
-### Field: `direction`
-- **Meaning:** Proposed trade direction.
-- **Type:** `int`
-- **Range:** `{-1, 0, 1}`.
-- **Validation:** Must be one of the three. NONE = abstention.
-- **Default:** 0.
+### Methods
 
-### Field: `confidence`
-- **Meaning:** Strategy confidence after weight normalization.
-- **Type:** `double`
-- **Range:** [0.0, 1.0].
-- **Validation:** Not NaN, not infinite, in [0,1] after clamp.
-- **Default:** 0.0.
-
-### Field: `suggested_volume`
-- **Meaning:** Suggested volume in lots.
-- **Type:** `double`
-- **Range:** [0.0, 100.0]. 0 = use default.
-- **Validation:** Not NaN, ≥ 0.
-- **Default:** 0.0.
-
-### Field: `suggested_entry`
-- **Meaning:** Suggested entry price.
-- **Type:** `double`
-- **Range:** > 0.0.
-- **Validation:** Not NaN, > 0.
-- **Default:** 0.0 (invalid).
-
-### Field: `suggested_sl`
-- **Meaning:** Suggested stop-loss.
-- **Type:** `double`
-- **Range:** > 0.0.
-- **Validation:** Not NaN, > 0 (for directional votes).
-- **Default:** 0.0 (invalid for directional).
-
-### Field: `suggested_tp`
-- **Meaning:** Suggested take-profit.
-- **Type:** `double`
-- **Range:** > 0.0.
-- **Validation:** Same as SL.
-- **Default:** 0.0 (invalid for directional).
-
-### Field: `snapshot_id`
-- **Meaning:** MarketState snapshot this vote was generated against.
-- **Type:** `long`
-- **Range:** > 0.
-- **Validation:** Must equal `state.snapshot_id`.
-- **Default:** 0 (invalid).
-
-### Field: `vote_time`
-- **Meaning:** Timestamp of vote generation.
-- **Type:** `datetime`
-- **Range:** > 0.
-- **Validation:** > 0.
-- **Default:** 0 (invalid).
+- `BuildDirectional(vote, meta, direction, confidence, entry, sl, tp, volume, snapshot_id)`
+- `BuildAbstention(vote, meta, snapshot_id)`
+- `BuildNeutral(vote, meta, snapshot_id)` — alias for abstention (used on failure)
+- `Validate(vote, out_reason)` — full validation
 
 ---
 
-# 8. Confidence Model
+# 7. StrategyExecutor
 
-### 8.1 — Confidence Calculation
-- Raw confidence in [0,1] from strategy.
+### Execution Pipeline
 
-### 8.2 — Clamping
-- `VoteValidator` clamps to [0,1] before weight. NaN → 0.0 (discard).
+1. Receive MarketState, Config, snapshot_id
+2. Validate market state (is_valid, snapshot_id > 0)
+3. Get enabled strategies sorted by priority
+4. Build StrategyContext
+5. For each strategy:
+   a. Check symbol support
+   b. Measure start time
+   c. Call `Evaluate(ctx, vote)`
+   d. Measure elapsed time
+   e. If failed: log, increment failure counter, continue
+   f. Validate vote via VoteBuilder
+   g. If directional: add to output array
+   h. If abstention: skip (don't add)
+6. Return vote count
 
-### 8.3 — Normalization (Weight Application)
-- `normalized = raw × weight`, clamped to [0,1].
+### Isolation Rules
 
-### 8.4 — Calibration
-- Static weights from config. No adaptive calibration in this phase.
+- Each strategy executes independently
+- No shared mutable state
+- A failure in one strategy does NOT affect others
+- The executor NEVER crashes because of a strategy failure
 
-### 8.5 — Weight Interaction
-- Weights multiply confidence, not direction.
+### Timeout Handling
 
-### 8.6 — Multiple Signals
-- One vote per strategy per evaluation. Internal conflict resolution is strategy's responsibility.
+- Per-strategy budget: 5 ms (soft limit)
+- Total budget: 30 ms (enforced by CoreEngine's TimeBudgetRunner)
+- Timeout is logged at WARN level but does NOT abort the strategy's vote
 
-### 8.7 — Neutral Confidence
-- 0.0 = abstention (discarded). Below 0.30 = valid but weak (Risk Engine rejects).
+### Statistics
 
-### 8.8 — Conflicting Signals
-- Not resolved by Strategy Engine. All valid votes returned. VoteAggregator handles.
+Per-strategy:
+- `evaluations` — total Evaluate() calls
+- `successes` — directional votes
+- `abstentions` — NONE votes
+- `failures` — failed/invalid votes
+- `total_latency_ms`, `peak_latency_ms`
 
-### 8.9 — Invalid Confidence
-- NaN/infinite → discard + failure counter increment.
-
----
-
-# 9. Multi Strategy Behaviour
-
-### 9.1 — Isolation
-- Full isolation. No shared mutable state. No cross-strategy visibility.
-
-### 9.2 — Shared State
-- Only immutable `MarketState` (read-only).
-
-### 9.3 — Weighting
-- Per-strategy weight applied to confidence.
-
-### 9.4 — Conflict Handling
-- Not resolved by Strategy Engine. VoteAggregator sums confidence per direction.
-
-### 9.5 — Priority
-- Lower priority number = executes first. Budget may exhaust lower-priority strategies.
-
-### 9.6 — Consensus
-- Not required. Single strategy vote is sufficient (subject to Risk Engine).
-
-### 9.7 — Abstain
-- `direction=NONE` → silently discarded (not a failure).
-
-### 9.8 — Duplicate Votes
-- Both returned. Deduplication is VoteAggregator's job.
-
-### 9.9 — Disabled Strategy
-- Not evaluated. No votes produced.
-
-### 9.10 — Unknown Strategy
-- Cannot produce votes (never invoked). ID mismatch → ERROR + discard.
+Aggregate:
+- `total_executions`, `total_failures`
+- `avg_latency_ms`, `peak_latency_ms`
 
 ---
 
-# 10. Error Isolation
+# 8. Lifecycle
 
-### 10.1 — Timeouts
-- Soft: 0.25 ms per strategy. Logged WARN. Vote still used.
+### Initialization
 
-### 10.2 — Exceptions
-- MQL5 has no try/catch. "Exception" = invalid output. VoteValidator catches.
+1. `StrategyEngine::SetDependencies(logger, context, config)`
+2. `StrategyEngine::Initialize()`
+   - Sets logger on registry, vote builder, executor
+   - Calls `executor.Initialize(logger, vote_builder)`
+3. `StrategyEngine::RegisterStrategy(strategy)` — called for each strategy
+   - Delegates to `registry.Register(strategy)`
 
-### 10.3 — Invalid Outputs
-- Bad direction, NaN confidence, zero prices → discarded.
+### Evaluation (per tick)
 
-### 10.4 — Memory Corruption Detection
-- Array bounds, string length, numeric range checks.
+1. CoreEngine calls `EvaluateStrategies(state, votes[])`
+2. StrategyEngine checks kill switch
+3. StrategyEngine validates market state
+4. StrategyEngine delegates to `executor.Execute(registry, state, config, snapshot_id, votes, count)`
+5. Executor iterates enabled strategies, calls Evaluate(), collects votes
+6. Returns vote count
 
-### 10.5 — NaN Detection
-- `MathIsValidNumber()` on every double field.
+### Shutdown
 
-### 10.6 — Overflow
-- Not possible (validation bounds all values).
-
-### 10.7 — Invalid Arrays
-- Caller array checked: < ATLAS_MAX_VOTES → truncate + WARN. Size 0 → return 0.
-
-### 10.8 — Stale Snapshot
-- Vote snapshot_id != input state snapshot_id → discard.
-
-### 10.9 — Contract Mismatch
-- `feature_count != 32` → reject entire evaluation.
+1. `StrategyEngine::Shutdown()`
+2. Executor logs stats
+3. Registry logs status
+4. Registry clears (does NOT delete strategies — caller owns them)
 
 ---
 
-# 11. Performance Budget
+# 9. Execution Order
 
-### 11.1 — Maximum Evaluation Time
-- Total: ≤ 2 ms. Per-strategy: ≤ 0.25 ms.
+Strategies execute in **priority order** (ascending — lower number = higher priority = executed first).
 
-### 11.2 — Memory Budget
-- Registry: ~1 KB. Stats: ~512 B. Vote buffer: ~2 KB. Total: ~3.5 KB stack.
-
-### 11.3 — No Dynamic Allocation
-- `new`/`delete` forbidden in `EvaluateStrategies`.
-
-### 11.4 — Fixed Arrays
-- `StrategyEntry[8]`, `StrategyStatEntry[8]`, `StrategyVote[16]`.
-
-### 11.5 — Maximum Strategies
-- 8 (compile-time).
-
-### 11.6 — Maximum Metadata
-- Name: 32 chars. Version: 16 chars. Tags: 64 chars.
+If the time budget is exhausted, lower-priority strategies may not execute. This is by design — high-priority strategies are more important.
 
 ---
 
-# 12. Metrics
+# 10. Registration
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `evaluations` | `ulong` | Total evaluations per strategy. |
-| `successes` | `ulong` | Valid directional votes. |
-| `abstentions` | `ulong` | NONE votes. |
-| `failures` | `ulong` | Invalid votes. |
-| `success_rate` | `double` | successes / evaluations. |
-| `abstain_rate` | `double` | abstentions / evaluations. |
-| `average_confidence` | `double` | Sum confidence / successes. |
-| `average_latency_ms` | `double` | Total latency / evaluations. |
-| `peak_latency_ms` | `double` | Max single-evaluation latency. |
-| `uptime_ticks` | `ulong` | Ticks since registration. |
+```cpp
+//--- In Bootstrap or application code:
+MyStrategy *strat = new MyStrategy();
+strat->Initialize(config);
+strategyEngine.RegisterStrategy(strat);
+```
+
+- Registration is typically done at startup, NOT during operation
+- The caller owns the strategy lifetime (Bootstrap deletes on shutdown)
+- Unregistration is supported but rarely needed
 
 ---
 
-# 13. Logging
+# 11. Isolation Rules
 
-| Level | Category | When |
-|-------|----------|------|
-| DEBUG | Per-strategy result | If `log_level <= DEBUG` |
-| DEBUG | Kill switch skip | When skipped |
-| INFO | Init / Shutdown / Registration / Diagnostics | Lifecycle events |
-| WARN | Invalid MarketState / Timeout / Vote failure / Array too small | Anomalies |
-| ERROR | Strategy ID mismatch / Not initialized / Logger NULL | Serious issues |
-| FATAL | Registry corruption | Should never happen |
-
-**Hot path rule:** No logging inside per-tick loop unless DEBUG level configured.
+1. **No strategy may access another strategy** — strategies don't have pointers to each other
+2. **No shared mutable state** — each strategy has its own private members
+3. **No static mutable variables** — strategies must not use `static` fields that persist across instances
+4. **No broker access** — StrategyContext has no IBrokerAdapter
+5. **No account access** — StrategyContext has no AccountInfo
+6. **No position access** — StrategyContext has no PositionState
+7. **Read-only market data** — StrategyContext wraps `const MarketState*`
+8. **Vote-only output** — the only way a strategy affects the system is through its StrategyVote
 
 ---
 
-# 14. Edge Cases
+# 12. Performance Requirements
+
+| Metric | Budget |
+|--------|--------|
+| Total framework latency | ≤ 30 ms |
+| Per-strategy evaluation | ≤ 5 ms (soft) |
+| VoteBuilder.BuildDirectional | O(1) |
+| VoteBuilder.Validate | O(1) |
+| Registry.Register | O(N), N ≤ 8 |
+| Registry.GetEnabledSorted | O(N log N), N ≤ 8 |
+| Executor.Execute | O(N), N ≤ 8 |
+| Heap allocation in Evaluate | 0 |
+| String operations in hot path | 0 (except on failure) |
+| Dynamic arrays | 0 (all fixed-size) |
+
+---
+
+# 13. Extension Guide
+
+### Adding a New Strategy
+
+1. Create a new class implementing `IStrategy`:
+```cpp
+class MyStrategy : public IStrategy
+{
+private:
+    StrategyMetadata m_meta;
+public:
+    MyStrategy(void)
+    {
+        m_meta.strategy_id = 10;
+        m_meta.name = "MyStrategy";
+        m_meta.version = "1.0.0";
+        m_meta.priority = 50;
+        m_meta.weight = 1.0;
+        //--- ...
+    }
+    virtual bool Initialize(const AtlasConfig &config) override { return true; }
+    virtual void Shutdown(void) override {}
+    virtual const StrategyMetadata& GetMetadata(void) const override { return m_meta; }
+    virtual bool Evaluate(const StrategyContext &ctx, StrategyVote &vote) override
+    {
+        //--- Read features from ctx.GetMarketState().features[]
+        //--- Build vote using VoteBuilder (passed via context or member)
+        //--- Return true on success, false on failure
+    }
+    virtual bool IsEnabled(void) const override { return true; }
+    virtual void Reset(void) override {}
+};
+```
+
+2. Register at startup:
+```cpp
+MyStrategy *strat = new MyStrategy();
+strat->Initialize(config);
+strategyEngine.RegisterStrategy(strat);
+```
+
+3. That's it. The framework handles execution, isolation, validation, and statistics.
+
+### What NOT to Do
+
+- Do NOT modify StrategyEngine.mqh to add strategies
+- Do NOT modify StrategyFramework/ files
+- Do NOT access broker/account/positions from a strategy
+- Do NOT share state between strategies
+- Do NOT use `Print()` — use the logger from StrategyContext
+
+---
+
+# 14. Test Coverage
+
+Tests are in `tests/StrategyFrameworkTests.mq5`:
+
+| Test | Coverage |
+|------|----------|
+| TestDuplicateRegistration | Same ID rejected |
+| TestDisabledStrategy | Disabled strategy skipped |
+| TestFailedStrategy | Failure doesn't stop others |
+| TestTimeoutStrategy | Latency tracked |
+| TestEmptyRegistry | Empty registry returns 0 votes |
+| TestVoteValidation | VoteBuilder validates/clamps |
+| TestMaxStrategyCount | Full registry rejects new |
+| TestPrioritySorting | Strategies sorted by priority |
+
+---
+
+# 15. Edge Cases
 
 | # | Case | Behavior |
 |---|------|----------|
-| EC1 | No MarketState | Validation fails, return 0 |
-| EC2 | Invalid MarketState | Return 0, log WARN |
-| EC3 | No strategies | Return 0, log DEBUG |
-| EC4 | All disabled | Return 0, log DEBUG |
-| EC5 | Duplicate ID | Reject registration, log WARN |
-| EC6 | Confidence 0 + direction BUY | Valid vote (Risk Engine rejects) |
-| EC7 | Confidence 0.5 + direction NONE | Abstention, discarded |
-| EC8 | NaN confidence | Discard, failure++, WARN |
-| EC9 | NaN entry price | Discard, failure++, WARN |
-| EC10 | direction = 5 | Discard, failure++, WARN |
-| EC11 | 5 ms timeout | Vote used, WARN logged |
-| EC12 | feature_count != 32 | Abort, return 0, ERROR |
-| EC13 | Snapshot mismatch | Discard vote, WARN |
-| EC14 | Registry corruption | FATAL, return 0 |
-| EC15 | Negative weight | Reject registration, ERROR |
-| EC16 | Kill switch active | Return 0, DEBUG |
-| EC17 | Fast market | Strategies still evaluate |
-| EC18 | Array size 0 | Return 0, WARN |
-| EC19 | Array < MAX_VOTES | Truncate, WARN |
-| EC20 | Not initialized | Return 0, ERROR |
-| EC21 | Logger NULL | Best-effort, no crash |
-| EC22 | Context NULL | Skip kill switch, ERROR once |
-| EC23 | Valid direction, zero SL/TP | Discard, WARN |
-| EC24 | > MAX_VOTES valid votes | Truncate, WARN |
-| EC25 | Empty version | Discard, WARN |
-
----
-
-# 15. Validation Matrix
-
-| Field | Validation | Action | Severity | Recovery |
-|-------|------------|--------|----------|----------|
-| `state.is_valid` | Must be true | Abort, return 0 | WARN | None |
-| `state.snapshot_id` | > 0 | Abort, return 0 | WARN | None |
-| `state.feature_count` | == 32 | Abort, return 0 | ERROR | None |
-| `state.atr_14` | > 0 | Abort, return 0 | WARN | None |
-| `state.timestamp` | > 0 | Abort, return 0 | WARN | None |
-| `state.symbol` | Non-empty | Abort, return 0 | WARN | None |
-| Kill switch | Inactive | Return 0 | DEBUG | None |
-| `strategy_id` | > 0 | Discard vote | WARN | Continue |
-| `strategy_id` | In registry | Discard vote | ERROR | Continue |
-| `strategy_version` | Non-empty | Discard vote | WARN | Continue |
-| `direction` | In {-1,0,1} | Discard vote | WARN | Continue |
-| `direction` | NONE → abstention | Discard (not failure) | DEBUG | Continue |
-| `confidence` | Not NaN | Discard vote | WARN | Continue |
-| `confidence` | In [0,1] after clamp | Clamp, accept | DEBUG | None |
-| `suggested_entry` | > 0 | Discard vote | WARN | Continue |
-| `suggested_sl` | > 0 (directional) | Discard vote | WARN | Continue |
-| `suggested_tp` | > 0 (directional) | Discard vote | WARN | Continue |
-| `suggested_volume` | ≥ 0 | Set to 0 (default) | DEBUG | None |
-| `snapshot_id` (vote) | == state.snapshot_id | Discard vote | WARN | Continue |
-| `vote_time` | > 0 | Set to TimeCurrent() | DEBUG | None |
-| Caller array | Size ≥ 1 | Return 0 | WARN | None |
-| Caller array | Size ≥ MAX_VOTES | Truncate | WARN | None |
-| Strategy weight | [0.1, 2.0] | Clamp | WARN | None |
-| Strategy elapsed | ≤ 0.25 ms | Log WARN, accept | WARN | None |
-
----
-
-# 16. State Machine
-
-```
-UNREGISTERED → REGISTERED → ENABLED → RUNNING → (ENABLED | FAILED)
-                                        │              │
-                                        │              │ ≥3 failures
-                                        │              ▼
-                                        │          RECOVERING → ENABLED
-                                        │
-                                    DISABLED → ENABLED
-```
-
-| State | Description |
-|-------|-------------|
-| **UNREGISTERED** | Not in registry. |
-| **REGISTERED** | In registry, disabled. |
-| **ENABLED** | Ready to evaluate. |
-| **RUNNING** | Currently executing. |
-| **FAILED** | Last output invalid. |
-| **DISABLED** | Explicitly disabled. |
-| **RECOVERING** | Cooldown after 3+ failures. |
-
----
-
-# 17. Production Checklist
-
-### 17.1 — Contract Alignment
-- [ ] `StrategyVote` matches `Contracts/RiskDecision.mqh`.
-- [ ] `MarketState` matches `Contracts/MarketState.mqh`.
-- [ ] `IStrategySet` matches `Interfaces/IStrategySet.mqh`.
-- [ ] Constants: `ATLAS_MAX_STRATEGIES`, `ATLAS_MAX_VOTES`, `ATLAS_FEATURE_SIZE`, `ATLAS_ORDER_*`, `ATLAS_MIN_CONFIDENCE`.
-
-### 17.2 — Dependency Alignment
-- [ ] `ILogger`, `IContextStore`, `AtlasConfig` available.
-- [ ] NO dependency on `IBrokerAdapter`, `IRiskEvaluator`, `IOrderBuilder`, `IMarketDataSource`.
-
-### 17.3 — File Structure
-- [ ] `Engines/StrategyEngine.mqh`
-- [ ] `Engines/StrategyEngine/`: StrategyEntry, StrategyRegistry, StrategyRunner, VoteValidator, ConfidenceNormalizer, StrategyStatistics, IStrategy, TrendFollowerStrategy, MeanReversionStrategy, MomentumStrategy, BreakoutStrategy
-
-### 17.4 — Performance
-- [ ] No `new`/`delete`. No `Print()`. No broker APIs. No file I/O. No recursion. Fixed arrays. < 4 KB stack.
-
-### 17.5 — MQL5 Compliance
-- [ ] Include guards. No `#pragma once`. No `->`. No STL. No dynamic arrays in structs.
-
-### 17.6 — Feature Vector Usage
-
-| Strategy | Features Used |
-|----------|---------------|
-| Trend Follower | 16, 17, 19, 4 |
-| Mean Reversion | 9, 8, 13 |
-| Momentum | 11, 12, 14 |
-| Breakout | 8, 7, 19 |
-
-### 17.7 — Error Handling
-- [ ] Input validation on every public method.
-- [ ] Strategy failure isolation.
-- [ ] NaN checks on all doubles.
-- [ ] Array bounds checks.
-
-### 17.8 — Documentation
-- [ ] Doxygen on every class/method/member.
-
-### 17.9 — Integration
-- [ ] `SetDependencies()` signature matches CoreEngine.
-- [ ] Output array caller-allocated.
-
-### 17.10 — Versioning
-- [ ] File header: `AtlasEA v0.1.2.0`.
-- [ ] All strategies return version "1.0.0".
+| EC1 | NULL strategy registered | Rejected |
+| EC2 | Duplicate ID | Rejected |
+| EC3 | Registry full | Rejected |
+| EC4 | Strategy fails (returns false) | Logged, neutral vote, continue |
+| EC5 | Strategy returns invalid vote | VoteBuilder catches, logged, continue |
+| EC6 | Strategy returns NaN confidence | VoteBuilder clamps to 0, continue |
+| EC7 | Strategy exceeds 5ms | Logged WARN, vote still used |
+| EC8 | Empty registry | Execute returns false, 0 votes |
+| EC9 | All strategies abstain | 0 votes, not an error |
+| EC10 | Kill switch active | 0 votes (checked by StrategyEngine) |
+| EC11 | Invalid market state | 0 votes |
+| EC12 | Feature count mismatch | 0 votes (contract violation) |
+| EC13 | Symbol not supported by strategy | Strategy skipped |
 
 ---
 
 **End of Specification.**
+
+The Strategy Framework is fully pluggable. New strategies can be added without modifying Core Engine or the framework itself. Every strategy is isolated, validated, and failure-safe.

@@ -82,11 +82,12 @@
 #define ATLAS_SESSION_OVERLAP  4
 
 //--- Log levels
-#define ATLAS_LOG_DEBUG   0
-#define ATLAS_LOG_INFO    1
-#define ATLAS_LOG_WARN    2
-#define ATLAS_LOG_ERROR   3
-#define ATLAS_LOG_FATAL   4
+#define ATLAS_LOG_TRACE   0
+#define ATLAS_LOG_DEBUG   1
+#define ATLAS_LOG_INFO    2
+#define ATLAS_LOG_WARN    3
+#define ATLAS_LOG_ERROR   4
+#define ATLAS_LOG_FATAL   5
 
 //--- Version
 #define ATLAS_VERSION_MAJOR  2
@@ -184,7 +185,7 @@ void AtlasConfigDefaults(AtlasConfig &cfg)
     cfg.fast_market_atr_mult    = 2.5;
     cfg.slippage_points         = 20;
 
-    cfg.log_level               = ATLAS_LOG_INFO;
+    cfg.log_level               = ATLAS_LOG_INFO;  ///< Note: TRACE=0, DEBUG=1, INFO=2, WARN=3, ERROR=4, FATAL=5
 }
 
 #endif // ATLAS_SETTINGS_MQH

@@ -1,19 +1,23 @@
 //+------------------------------------------------------------------+
 //|                                                       AtlasEA.mq5|
-//|                                              AtlasEA v0.1.8.0    |
+//|                                              AtlasEA v0.1.21.0   |
 //|                Event-Driven Multi-Strategy Expert Advisor        |
 //|                                                                  |
-//|  v0.1.8.0: Bootstrap layer introduced. AtlasEA.mq5 is now a      |
-//|  thin entry point — all construction, DI, and wiring lives in    |
-//|  Bootstrap/AtlasBootstrap.mqh.                                   |
+//|  v0.1.21.0: Production DI Container + Bootstrapper.             |
+//|  AtlasEA.mq5 is a thin entry point:                              |
+//|    1. Create Bootstrapper                                        |
+//|    2. Bootstrap application                                      |
+//|    3. Resolve CoreEngine                                         |
+//|    4. Run                                                        |
+//|    5. Shutdown through Bootstrapper                              |
 //+------------------------------------------------------------------+
-#property copyright   "AtlasEA v0.1.8.0"
+#property copyright   "AtlasEA v0.1.21.0"
 #property link        "https://atlas.example"
-#property version     "0.18"
+#property version     "0.21"
 #property description "AtlasEA - event-driven, multi-strategy EA"
-#property description "Bootstrap-driven dependency injection"
+#property description "Production DI container + bootstrapper"
 
-#include "Bootstrap/AtlasBootstrap.mqh"
+#include "Core/Bootstrapper.mqh"
 
 //+------------------------------------------------------------------+
 //| Inputs                                                           |
@@ -32,13 +36,13 @@ input int              InpTpAtrMult        = 4;          // TP = ATR * mult
 input int              InpMaxRetries       = 3;          // OrderSend retries
 input int              InpSnapshotSec      = 300;        // Snapshot interval (sec)
 input int              InpHeartbeatSec     = 10;         // Heartbeat interval (sec)
-input int              InpLogLevel         = 1;          // Log level (0=Debug,1=Info,2=Warn,3=Error,4=Fatal)
+input int              InpLogLevel         = 2;          // Log level (0=Trace,1=Debug,2=Info,3=Warn,4=Error,5=Fatal)
 
 //+------------------------------------------------------------------+
 //| Globals                                                          |
 //+------------------------------------------------------------------+
-AtlasBootstrap *g_bootstrap = NULL;
-CoreEngine     *g_core_engine = NULL;
+Bootstrapper  *g_bootstrapper = NULL;
+CoreEngine    *g_core_engine  = NULL;
 
 //+------------------------------------------------------------------+
 //| Build config from inputs                                         |
@@ -66,49 +70,49 @@ void BuildConfigFromInputs(AtlasConfig &cfg)
 //+------------------------------------------------------------------+
 //| OnInit — thin entry point                                        |
 //|                                                                  |
-//|  All construction and wiring is delegated to AtlasBootstrap.     |
-//|  The .mq5 file only:                                             |
-//|    1. Builds the config from inputs                              |
-//|    2. Creates the bootstrap                                      |
-//|    3. Calls bootstrap.Initialize(config)                         |
-//|    4. Stores the returned CoreEngine                             |
+//|  Startup flow:                                                   |
+//|    1. Build config from inputs                                   |
+//|    2. Create Bootstrapper                                        |
+//|    3. Bootstrap application (creates + injects + validates all)  |
+//|    4. Store CoreEngine pointer                                   |
 //+------------------------------------------------------------------+
 int OnInit(void)
 {
     AtlasConfig cfg;
     BuildConfigFromInputs(cfg);
 
-    g_bootstrap = new AtlasBootstrap();
-    if(g_bootstrap == NULL)
+    g_bootstrapper = new Bootstrapper();
+    if(g_bootstrapper == NULL)
     {
-        Print("AtlasEA: FATAL — cannot create AtlasBootstrap");
+        Print("AtlasEA: FATAL — cannot create Bootstrapper");
         return INIT_FAILED;
     }
 
-    g_core_engine = g_bootstrap.Initialize(cfg);
+    //--- Bootstrap the entire application
+    g_core_engine = g_bootstrapper.Bootstrap(cfg);
     if(g_core_engine == NULL)
     {
-        Print("AtlasEA: FATAL — bootstrap initialization failed");
-        delete g_bootstrap;
-        g_bootstrap = NULL;
+        Print("AtlasEA: FATAL — bootstrap failed: ", g_bootstrapper.GetFailureReason());
+        delete g_bootstrapper;
+        g_bootstrapper = NULL;
         return INIT_FAILED;
     }
 
-    Print("AtlasEA v0.1.8.0: initialized successfully on ", cfg.symbol);
+    Print("AtlasEA v0.1.21.0: initialized successfully on ", cfg.symbol);
     return INIT_SUCCEEDED;
 }
 
 //+------------------------------------------------------------------+
-//| OnDeinit — thin entry point                                      |
+//| OnDeinit — shutdown through Bootstrapper                         |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-    if(g_bootstrap != NULL)
+    if(g_bootstrapper != NULL)
     {
-        g_bootstrap.Shutdown();
-        delete g_bootstrap;
-        g_bootstrap   = NULL;
-        g_core_engine = NULL;  //--- deleted by bootstrap.Shutdown()
+        g_bootstrapper.Shutdown();
+        delete g_bootstrapper;
+        g_bootstrapper = NULL;
+        g_core_engine  = NULL;  //--- deleted by Bootstrapper.Shutdown()
     }
 }
 

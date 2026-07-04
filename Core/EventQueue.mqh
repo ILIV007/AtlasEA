@@ -9,6 +9,7 @@
 #include "../Contracts/Events.mqh"
 #include "../Interfaces/ILogger.mqh"
 #include "RingBuffer.mqh"
+#include "ValidationResult.mqh"
 
 /**
  * @class EventQueue
@@ -115,6 +116,40 @@ public:
 
     /// @brief Reset all statistics (not the buffers themselves).
     void ResetStats(void);
+
+    /**
+     * @brief Validate the event queue integrity.
+     * @return ValidationResult.
+     *
+     * Invariants:
+     *   - both ring buffers have count in [0, capacity]
+     *   - head/tail indices are within [0, capacity)
+     *   - total_dropped is non-negative
+     *   - logger pointer is either NULL or valid (non-dangling — caller's responsibility)
+     */
+    ValidationResult Validate(void) const
+    {
+        //--- Normal queue: count within capacity
+        if(m_normal.Count() < 0 || m_normal.Count() > m_normal.Capacity())
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "normal queue count out of range", "normal.count");
+        //--- Priority queue: count within capacity
+        if(m_priority.Count() < 0 || m_priority.Count() > m_priority.Capacity())
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "priority queue count out of range", "priority.count");
+        //--- Capacity must be positive
+        if(m_normal.Capacity() <= 0)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "normal queue capacity <= 0", "normal.capacity");
+        if(m_priority.Capacity() <= 0)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "priority queue capacity <= 0", "priority.capacity");
+        //--- Dropped count non-negative
+        if(m_total_dropped < 0)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "total_dropped < 0", "total_dropped");
+        return ValidationResult::Ok();
+    }
 };
 
 //+------------------------------------------------------------------+

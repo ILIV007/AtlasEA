@@ -6,10 +6,12 @@
 #define ATLAS_MT5_ADAPTER_MQH
 
 #include "../Config/Settings.mqh"
+#include "../Core/ValidationResult.mqh"
 #include "../Contracts/Events.mqh"
 #include "../Contracts/RiskDecision.mqh"
 #include "../Contracts/MarketState.mqh"
-#include "../Core/IEventBus.mqh"
+#include "../Interfaces/IEventBus.mqh"
+#include "../Interfaces/IBrokerAdapter.mqh"
 
 //+------------------------------------------------------------------+
 //| MT5Adapter                                                       |
@@ -18,10 +20,11 @@
 //|   - translates MQL retcodes into Atlas fill statuses             |
 //|   - emits ExecutionEvents onto the bus                           |
 //+------------------------------------------------------------------+
-class MT5Adapter
+class MT5Adapter : public IBrokerAdapter
 {
 private:
     IEventBus  *m_event_bus;
+    ILogger    *m_logger;
     AtlasConfig m_config;
     int         m_total_retries;
 
@@ -32,18 +35,74 @@ private:
 
 public:
                 MT5Adapter(IEventBus *bus);
+
+    //--- Interface-compatible lifecycle (overrides) ---
+    virtual bool   Initialize(void) override { return true; }
+    virtual void   Shutdown(void) override { m_event_bus = NULL; }
+
+    //--- Extended init with config (called by Bootstrapper) ---
     bool        Initialize(const AtlasConfig &config);
-    RawTick     CaptureTick(void);
-    void        CaptureTrade(void);
-    bool        SendOrder(const OrderRequest &req);
-    PositionSnapshotEvent QueryBrokerPositions(void);
+
+    //--- Set logger (called by Bootstrapper) ---
+    void        SetLogger(ILogger *logger) { m_logger = logger; }
+
+    //--- IBrokerAdapter overrides ---
+    virtual RawTick     CaptureTick(void) override;
+    virtual void        CaptureTrade(void) override;
+    virtual bool        SendOrder(const OrderRequest &req) override;
+    virtual int         CloseAllPositionsForMagic(const string reason) override;
+    virtual PositionSnapshotEvent QueryBrokerPositions(void) override;
+    virtual int         CountPositionsForMagic(void) override;
+    virtual double      AccountEquity(void) override;
+    virtual double      AccountBalance(void) override;
+    virtual double      AccountMargin(void) override;
+    virtual double      AccountMarginLevel(void) override;
+    virtual double      SymbolPoint(void) override;
+    virtual int         SymbolDigits(void) override;
+    virtual double      SymbolBid(void) override;
+    virtual double      SymbolAsk(void) override;
+    virtual double      SymbolVolumeMin(void) override;
+    virtual double      SymbolVolumeMax(void) override;
+    virtual double      SymbolVolumeStep(void) override;
+    virtual long        SymbolStopsLevel(void) override;
+    virtual double      SymbolContractSize(void) override;
+    virtual long        SymbolFillingMode(void) override;
+    virtual int         CreateATR(int period) override;
+    virtual int         CreateMA(int period, int ma_method, int applied_price) override;
+    virtual int         CreateRSI(int period, int applied_price) override;
+    virtual int         CreateMACD(int fast, int slow, int signal, int applied_price) override;
+    virtual int         CreateStochastic(int k, int d, int slow, int ma_method, int price_field) override;
+    virtual int         CreateCCI(int period, int applied_price) override;
+    virtual int         CreateADX(int period) override;
+    virtual int         CreateBands(int period, double deviation, int applied_price) override;
+    virtual int         CopyBuffer(int handle, int buffer_num, int start, int count, double &buffer[]) override;
+    virtual int         CopyRates(int start, int count, MqlRates &rates[]) override;
+    virtual void        ReleaseIndicator(int handle) override;
+    virtual int         PeriodSeconds(void) override;
+
     int         TotalRetries(void) const { return m_total_retries; }
+
+    //--- Design by Contract: validate internal invariants ---
+    //    The adapter is mostly stateless (a thin wrapper around the MT5
+    //    terminal API). The only mutable state is m_total_retries, which
+    //    must be non-negative. m_event_bus may legitimately be NULL (after
+    //    Shutdown or before Initialize) — no structural check is possible
+    //    on it; we just report Ok() since both states are valid.
+    ValidationResult Validate(void) const
+    {
+        if(m_total_retries < 0)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                                          "m_total_retries < 0",
+                                          "m_total_retries");
+        return ValidationResult::Ok();
+    }
 };
 
 //+------------------------------------------------------------------+
 MT5Adapter::MT5Adapter(IEventBus *bus)
 {
     m_event_bus     = bus;
+    m_logger        = NULL;
     m_total_retries = 0;
 }
 
@@ -86,7 +145,6 @@ bool MT5Adapter::IsRetryableError(int retcode) const
             retcode == TRADE_RETCODE_PRICE_CHANGED  ||
             retcode == TRADE_RETCODE_TIMEOUT        ||
             retcode == TRADE_RETCODE_CONNECTION     ||
-            retcode == TRADE_RETCODE_PRICE_CHANGED  ||
             retcode == TRADE_RETCODE_ERROR);
 }
 
@@ -173,10 +231,11 @@ bool MT5Adapter::SendOrder(const OrderRequest &req)
         {
             int fill = (ret == TRADE_RETCODE_DONE) ? ATLAS_FILL_FILLED : ATLAS_FILL_PARTIAL;
             EmitExecutionEvent(req, mt_res, fill);
-            Print("[MT5Adapter] Order filled. req=", req.request_id,
-                  " vol=", DoubleToString(mt_res.volume, m_config.volume_digits),
-                  " price=", DoubleToString(mt_res.price, _Digits),
-                  " attempt=", attempt);
+            if(m_logger != NULL)
+                m_logger.Info("MT5Adapter", "Order filled. req=" + req.request_id +
+                      " vol=" + DoubleToString(mt_res.volume, m_config.volume_digits) +
+                      " price=" + DoubleToString(mt_res.price, _Digits) +
+                      " attempt=" + IntegerToString(attempt));
             return true;
         }
 
@@ -184,9 +243,10 @@ bool MT5Adapter::SendOrder(const OrderRequest &req)
         if(!IsRetryableError(ret) || attempt == m_config.max_retries)
         {
             EmitExecutionEvent(req, mt_res, TranslateRetcode(ret));
-            Print("[MT5Adapter] Order FAILED. req=", req.request_id,
-                  " retcode=", ret, " (", mt_res.comment, ")",
-                  " attempt=", attempt);
+            if(m_logger != NULL)
+                m_logger.Error("MT5Adapter", "Order FAILED. req=" + req.request_id +
+                      " retcode=" + IntegerToString(ret) + " (" + mt_res.comment + ")" +
+                      " attempt=" + IntegerToString(attempt));
             return false;
         }
 
@@ -259,6 +319,97 @@ void MT5Adapter::CaptureTrade(void)
     ev.snapshot_id   = 0;
     ev.payload_size  = 0;
     m_event_bus.EmitPriorityEvent(ev);
+}
+
+//+------------------------------------------------------------------+
+//| Missing IBrokerAdapter method implementations                     |
+//+------------------------------------------------------------------+
+
+int MT5Adapter::CloseAllPositionsForMagic(const string reason)
+{
+    int closed = 0;
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket <= 0) continue;
+        if(!PositionSelectByTicket(ticket)) continue;
+        if(PositionGetInteger(POSITION_MAGIC) != m_config.magic_number) continue;
+
+        MqlTradeRequest req; MqlTradeResult res;
+        ZeroMemory(req); ZeroMemory(res);
+        req.action    = TRADE_ACTION_DEALS;
+        req.position  = ticket;
+        req.symbol    = PositionGetString(POSITION_SYMBOL);
+        req.volume    = PositionGetDouble(POSITION_VOLUME);
+        long ptype    = PositionGetInteger(POSITION_TYPE);
+        req.type      = (ptype == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+        req.price     = (ptype == POSITION_TYPE_BUY) ? SymbolInfoDouble(req.symbol, SYMBOL_BID)
+                                                     : SymbolInfoDouble(req.symbol, SYMBOL_ASK);
+        req.deviation = (ulong)m_config.slippage_points;
+        req.magic     = (ulong)m_config.magic_number;
+        req.comment   = "AtlasEA_KillSwitch";
+        req.type_filling = ORDER_FILLING_IOC;
+        if(OrderSend(req, res)) closed++;
+    }
+    return closed;
+}
+
+int MT5Adapter::CountPositionsForMagic(void)
+{
+    int count = 0;
+    for(int i = 0; i < PositionsTotal(); i++)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket <= 0) continue;
+        if(!PositionSelectByTicket(ticket)) continue;
+        if(PositionGetInteger(POSITION_MAGIC) == m_config.magic_number) count++;
+    }
+    return count;
+}
+
+double MT5Adapter::AccountEquity(void)      { return AccountInfoDouble(ACCOUNT_EQUITY); }
+double MT5Adapter::AccountBalance(void)     { return AccountInfoDouble(ACCOUNT_BALANCE); }
+double MT5Adapter::AccountMargin(void)      { return AccountInfoDouble(ACCOUNT_MARGIN); }
+double MT5Adapter::AccountMarginLevel(void) { return AccountInfoDouble(ACCOUNT_MARGIN_LEVEL); }
+
+double MT5Adapter::SymbolPoint(void)        { return SymbolInfoDouble(m_config.symbol, SYMBOL_POINT); }
+int    MT5Adapter::SymbolDigits(void)       { return (int)SymbolInfoInteger(m_config.symbol, SYMBOL_DIGITS); }
+double MT5Adapter::SymbolBid(void)          { return SymbolInfoDouble(m_config.symbol, SYMBOL_BID); }
+double MT5Adapter::SymbolAsk(void)          { return SymbolInfoDouble(m_config.symbol, SYMBOL_ASK); }
+double MT5Adapter::SymbolVolumeMin(void)    { return SymbolInfoDouble(m_config.symbol, SYMBOL_VOLUME_MIN); }
+double MT5Adapter::SymbolVolumeMax(void)    { return SymbolInfoDouble(m_config.symbol, SYMBOL_VOLUME_MAX); }
+double MT5Adapter::SymbolVolumeStep(void)   { return SymbolInfoDouble(m_config.symbol, SYMBOL_VOLUME_STEP); }
+long   MT5Adapter::SymbolStopsLevel(void)   { return SymbolInfoInteger(m_config.symbol, SYMBOL_TRADE_STOPS_LEVEL); }
+double MT5Adapter::SymbolContractSize(void) { return SymbolInfoDouble(m_config.symbol, SYMBOL_TRADE_CONTRACT_SIZE); }
+long   MT5Adapter::SymbolFillingMode(void)  { return SymbolInfoInteger(m_config.symbol, SYMBOL_FILLING_MODE); }
+
+int MT5Adapter::CreateATR(int period)              { return iATR(m_config.symbol, PERIOD_CURRENT, period); }
+int MT5Adapter::CreateMA(int p, int m, int ap)     { return iMA(m_config.symbol, PERIOD_CURRENT, p, 0, m, ap); }
+int MT5Adapter::CreateRSI(int p, int ap)            { return iRSI(m_config.symbol, PERIOD_CURRENT, p, ap); }
+int MT5Adapter::CreateMACD(int f, int s, int sig, int ap) { return iMACD(m_config.symbol, PERIOD_CURRENT, f, s, sig, ap); }
+int MT5Adapter::CreateStochastic(int k, int d, int sl, int m, int pf) { return iStochastic(m_config.symbol, PERIOD_CURRENT, k, d, sl, m, pf); }
+int MT5Adapter::CreateCCI(int p, int ap)            { return iCCI(m_config.symbol, PERIOD_CURRENT, p, ap); }
+int MT5Adapter::CreateADX(int p)                    { return iADX(m_config.symbol, PERIOD_CURRENT, p); }
+int MT5Adapter::CreateBands(int p, double dev, int ap) { return iBands(m_config.symbol, PERIOD_CURRENT, p, 0, dev, ap); }
+
+int MT5Adapter::CopyBuffer(int handle, int buf, int start, int count, double &buffer[])
+{
+    return ::CopyBuffer(handle, buf, start, count, buffer);
+}
+
+int MT5Adapter::CopyRates(int start, int count, MqlRates &rates[])
+{
+    return ::CopyRates(m_config.symbol, PERIOD_CURRENT, start, count, rates);
+}
+
+void MT5Adapter::ReleaseIndicator(int handle)
+{
+    if(handle != INVALID_HANDLE) IndicatorRelease(handle);
+}
+
+int MT5Adapter::PeriodSeconds(void)
+{
+    return ::PeriodSeconds(PERIOD_CURRENT);
 }
 
 #endif // ATLAS_MT5_ADAPTER_MQH

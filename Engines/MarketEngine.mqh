@@ -19,6 +19,7 @@
 
 #include "../Config/Settings.mqh"
 #include "../Contracts/MarketState.mqh"
+#include "../Core/ValidationResult.mqh"
 #include "../Interfaces/ILogger.mqh"
 #include "../Interfaces/IBrokerAdapter.mqh"
 #include "../Interfaces/IMarketDataSource.mqh"
@@ -26,6 +27,7 @@
 #include "MarketEngine/TickValidator.mqh"
 #include "MarketEngine/SessionDetector.mqh"
 #include "MarketEngine/IndicatorCache.mqh"
+#include "MarketEngine/ATRCalculator.mqh"
 #include "MarketEngine/TrendDetector.mqh"
 #include "MarketEngine/RegimeDetector.mqh"
 #include "MarketEngine/FeatureExtractor.mqh"
@@ -71,6 +73,7 @@ private:
     TickValidator   m_tick_validator;   ///< Tick validation
     SessionDetector m_session_detector; ///< Session detection
     IndicatorCache  m_indicator_cache;  ///< Indicator handle + value cache
+    ATRCalculator   m_atr_calculator;   ///< ATR(14) with Wilder smoothing
     TrendDetector   m_trend_detector;   ///< Trend detection
     RegimeDetector  m_regime_detector;  ///< Regime detection
     FeatureExtractor m_feature_extractor; ///< 32-feature extraction
@@ -199,6 +202,51 @@ public:
 
     /// @brief Log diagnostics summary.
     void LogDiagnostics(void) const;
+
+    //=== Design by Contract (v0.1.26.x) ===
+
+    /**
+     * @brief Validate internal state for consistency.
+     * @return ValidationResult — Ok() if all invariants hold, Fail() otherwise.
+     *
+     * Invariants checked:
+     *   - m_broker != NULL (required dependency)
+     *   - m_logger != NULL (required dependency)
+     *   - m_indicator_cache.IsInitialized() (lifecycle proxy for the
+     *     engine itself — MarketEngine has no explicit m_initialized flag,
+     *     so the indicator cache state serves as the init sentinel)
+     *   - m_bar_buffer.Count() in [0, ATLAS_BAR_BUFFER_CAPACITY]
+     *
+     * Note: MarketEngine does NOT cache the last MarketState (it builds a
+     * fresh immutable snapshot per ProcessTick call), so there is no
+     * cached-state validation to delegate to here. MarketState invariants
+     * are enforced inside ProcessTick via BuildMarketState().
+     *
+     * Non-throwing (MQL5 has no exceptions).
+     */
+    ValidationResult Validate(void) const
+    {
+        if(m_broker == NULL)
+            return ValidationResult::Fail(ATLAS_V_NOT_INITIALIZED,
+                "broker adapter is NULL", "m_broker");
+        if(m_logger == NULL)
+            return ValidationResult::Fail(ATLAS_V_NOT_INITIALIZED,
+                "logger is NULL", "m_logger");
+        if(!m_indicator_cache.IsInitialized())
+            return ValidationResult::Fail(ATLAS_V_NOT_INITIALIZED,
+                "indicator cache not initialized (engine not initialized)",
+                "m_indicator_cache");
+        int bar_count = m_bar_buffer.Count();
+        if(bar_count < 0 || bar_count > ATLAS_BAR_BUFFER_CAPACITY)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "bar buffer count out of range [0, " +
+                IntegerToString(ATLAS_BAR_BUFFER_CAPACITY) + "]",
+                "m_bar_buffer");
+        return ValidationResult::Ok();
+    }
+
+    /// @brief Convenience wrapper — true if Validate() passes.
+    bool IsValid(void) const { return Validate().valid; }
 };
 
 //+------------------------------------------------------------------+
@@ -245,7 +293,8 @@ bool MarketEngine::Initialize(void)
     }
 
     //--- Initialize internal components
-    m_tick_validator.Initialize(m_logger, m_config.max_spread_points, 30, 5);
+    double pt = (m_broker != NULL) ? m_broker.SymbolPoint() : 0.00001;
+    m_tick_validator.Initialize(m_logger, m_config.max_spread_points, pt, 30, 5);
     m_session_detector.Initialize(m_logger, 0);  //--- Server UTC offset = 0 (adjust per broker)
 
     if(!m_indicator_cache.Initialize(m_broker, m_logger, m_config))
@@ -254,6 +303,7 @@ bool MarketEngine::Initialize(void)
         return false;
     }
 
+    m_atr_calculator.Initialize(m_config.atr_period);
     m_trend_detector.Initialize(m_logger, 0.25);
     m_regime_detector.Initialize(m_logger);
     m_feature_extractor.Initialize(m_logger);
@@ -267,6 +317,7 @@ bool MarketEngine::Initialize(void)
     int copied = m_broker.CopyRates(0, ATLAS_BAR_BUFFER_CAPACITY + 1, rates);
     if(copied > 1)
     {
+        double running_prev_close = 0.0;
         for(int i = copied - 1; i >= 1; i--)
         {
             BarData bar;
@@ -278,6 +329,10 @@ bool MarketEngine::Initialize(void)
             bar.tick_volume = (long)rates[i].tick_volume;
             bar.real_volume = (long)rates[i].real_volume;
             m_bar_buffer.AddBar(bar);
+
+            //--- Seed ATR calculator with historical bars
+            m_atr_calculator.OnBarClose(bar.high, bar.low, bar.close, running_prev_close);
+            running_prev_close = bar.close;
         }
 
         //--- Set up the forming bar from the most recent rate
@@ -313,7 +368,12 @@ void MarketEngine::Shutdown(void)
 {
     m_indicator_cache.Shutdown();
     m_has_current_bar = false;
+    m_last_bar_time   = 0;
     m_bar_buffer.Reset();
+
+    //--- Clear diagnostics so a re-Initialize() starts with zeroed counters.
+    //    Without this, lifetime totals carry over across restart.
+    ZeroMemory(m_diag);
 
     if(m_logger != NULL)
         m_logger.Info("MarketEngine", "Shutdown complete");
@@ -369,7 +429,20 @@ bool MarketEngine::CheckNewBar(const RawTick &tick)
 void MarketEngine::CloseCurrentBar(void)
 {
     if(!m_has_current_bar) return;
+
+    //--- Get previous close for ATR True Range calculation
+    double prev_close = 0.0;
+    BarData prev_bar;
+    if(m_bar_buffer.GetNewest(prev_bar))
+        prev_close = prev_bar.close;
+
+    //--- Add to ring buffer
     m_bar_buffer.AddBar(m_current_bar);
+
+    //--- Update ATR calculator with the newly closed bar
+    m_atr_calculator.OnBarClose(m_current_bar.high, m_current_bar.low,
+                                 m_current_bar.close, prev_close);
+
     m_diag.total_new_bars++;
 }
 

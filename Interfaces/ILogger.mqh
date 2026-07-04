@@ -21,12 +21,14 @@ class ILogger
 public:
     /**
      * @brief Log a message at the given level.
-     * @param level   ATLAS_LOG_DEBUG .. ATLAS_LOG_FATAL
+     * @param level   ATLAS_LOG_TRACE .. ATLAS_LOG_FATAL
      * @param module  Source module name (e.g. "CoreEngine", "RiskEngine")
      * @param message Human-readable description
      */
     virtual void Log(const int level, const string module, const string message) = 0;
 
+    /// @brief Convenience: TRACE level (finest granularity)
+    virtual void Trace(const string module, const string message) = 0;
     /// @brief Convenience: DEBUG level
     virtual void Debug(const string module, const string message) = 0;
     /// @brief Convenience: INFO level

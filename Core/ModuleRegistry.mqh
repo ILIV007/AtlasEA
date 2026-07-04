@@ -1,269 +1,306 @@
 //+------------------------------------------------------------------+
-//|                                      Core/ModuleRegistry.mqh
-//|            AtlasEA v2.0 - Module Registration & Discovery         |
+//|                      Core/ModuleRegistry.mqh                    |
+//|       AtlasEA v0.1.21.0 - Module Registry (upgraded v2)        |
 //+------------------------------------------------------------------+
 #ifndef ATLAS_MODULE_REGISTRY_MQH
 #define ATLAS_MODULE_REGISTRY_MQH
 
 #include "../Config/Settings.mqh"
+#include "../Interfaces/IModuleRegistry.mqh"
 #include "../Interfaces/ILogger.mqh"
 
 /**
- * @class ModuleRegistry
- * @brief Tracks which modules are registered and initialized.
- *
- * Provides module discovery for diagnostics and startup validation.
- * Each module is identified by its ATLAS_MODULE_* ID and has a name,
- * initialization status, and a version string.
- *
- * Memory: fixed-size arrays (no dynamic allocation).
+ * @brief Maximum registered modules.
  */
-class ModuleRegistry
+#define ATLAS_MODULE_MAX 32
+
+/**
+ * @class ModuleRegistry
+ * @brief Concrete implementation of IModuleRegistry.
+ *
+ * Tracks module registration, startup/shutdown order, health, versions,
+ * and dependency lists.
+ *
+ * Fixed-size arrays. No dynamic allocation.
+ */
+class ModuleRegistry : public IModuleRegistry
 {
 private:
-    /// Maximum registered modules
-    static const int MAX_MODULES = 16;
+    ModuleInfo m_modules[ATLAS_MODULE_MAX];
+    int        m_count;
+    ILogger   *m_logger;
 
-    int     m_ids[MAX_MODULES];       ///< Module IDs
-    string  m_names[MAX_MODULES];     ///< Human-readable names
-    string  m_versions[MAX_MODULES];  ///< Version strings
-    bool    m_initialized[MAX_MODULES]; ///< Init status
-    datetime m_init_time[MAX_MODULES]; ///< When initialized
-    int     m_count;                  ///< Number of registered modules
-    ILogger *m_logger;
-
-    /// @brief Find the index of a module by ID. Returns -1 if not found.
-    int FindIndex(const int module_id) const;
+    int FindIndex(const int module_id) const
+    {
+        for(int i = 0; i < m_count; i++)
+        {
+            if(m_modules[i].module_id == module_id)
+                return i;
+        }
+        return -1;
+    }
 
 public:
     /**
      * @brief Constructor.
      */
-    ModuleRegistry(void);
+    ModuleRegistry(void)
+    {
+        m_logger = NULL;
+        m_count  = 0;
+        for(int i = 0; i < ATLAS_MODULE_MAX; i++)
+        {
+            m_modules[i].module_id        = 0;
+            m_modules[i].name             = "";
+            m_modules[i].version          = "";
+            m_modules[i].health           = ATLAS_MODULE_HEALTH_UNKNOWN;
+            m_modules[i].startup_order    = 999;
+            m_modules[i].shutdown_order   = 999;
+            m_modules[i].dependency_count = 0;
+            m_modules[i].initialized      = false;
+            m_modules[i].init_time        = 0;
+            m_modules[i].failure_reason   = "";
+            for(int j = 0; j < 8; j++)
+                m_modules[i].dependencies[j] = 0;
+        }
+    }
 
-    /**
-     * @brief Set the logger.
-     */
     void SetLogger(ILogger *logger) { m_logger = logger; }
 
-    /**
-     * @brief Register a module.
-     * @param module_id  ATLAS_MODULE_* constant.
-     * @param name       Human-readable name.
-     * @param version    Version string.
-     * @return true if registered, false if table full or duplicate.
-     */
-    bool Register(const int module_id, const string name, const string version);
+    //=== IModuleRegistry implementation ===
 
-    /**
-     * @brief Mark a module as initialized.
-     * @param module_id ATLAS_MODULE_* constant.
-     * @return true if marked, false if not registered.
-     */
-    bool MarkInitialized(const int module_id);
-
-    /**
-     * @brief Check if a module is registered.
-     */
-    bool IsRegistered(const int module_id) const;
-
-    /**
-     * @brief Check if a module is initialized.
-     */
-    bool IsInitialized(const int module_id) const;
-
-    /**
-     * @brief Get the name of a module.
-     */
-    string GetName(const int module_id) const;
-
-    /**
-     * @brief Get the version of a module.
-     */
-    string GetVersion(const int module_id) const;
-
-    /**
-     * @brief Get the initialization time of a module.
-     */
-    datetime GetInitTime(const int module_id) const;
-
-    /// @brief Number of registered modules.
-    int Count(void) const { return m_count; }
-
-    /**
-     * @brief Check if all registered modules are initialized.
-     * @return true if every registered module has been marked initialized.
-     */
-    bool AllInitialized(void) const;
-
-    /**
-     * @brief Reset the registry (shutdown).
-     */
-    void Reset(void);
-
-    /**
-     * @brief Log the status of all registered modules.
-     */
-    void LogStatus(void) const;
-};
-
-//+------------------------------------------------------------------+
-//| ModuleRegistry implementation                                     |
-//+------------------------------------------------------------------+
-
-ModuleRegistry::ModuleRegistry(void)
-{
-    m_logger = NULL;
-    m_count  = 0;
-    for(int i = 0; i < MAX_MODULES; i++)
+    virtual bool Register(const int module_id, const string name, const string version,
+                           const int startup_order, const int shutdown_order) override
     {
-        m_ids[i]         = 0;
-        m_initialized[i] = false;
-        m_init_time[i]   = 0;
-    }
-}
-
-//+------------------------------------------------------------------+
-int ModuleRegistry::FindIndex(const int module_id) const
-{
-    for(int i = 0; i < m_count; i++)
-    {
-        if(m_ids[i] == module_id)
-            return i;
-    }
-    return -1;
-}
-
-//+------------------------------------------------------------------+
-bool ModuleRegistry::Register(const int module_id, const string name, const string version)
-{
-    if(module_id <= 0)
-    {
-        if(m_logger != NULL)
-            m_logger.Error("ModuleRegistry", "Register: invalid module_id");
-        return false;
-    }
-
-    if(FindIndex(module_id) >= 0)
-    {
-        if(m_logger != NULL)
-            m_logger.Warn("ModuleRegistry", "Register: module " + IntegerToString(module_id) + " already registered");
-        return false;
-    }
-
-    if(m_count >= MAX_MODULES)
-    {
-        if(m_logger != NULL)
-            m_logger.Error("ModuleRegistry", "Register: table full");
-        return false;
-    }
-
-    m_ids[m_count]         = module_id;
-    m_names[m_count]       = name;
-    m_versions[m_count]    = version;
-    m_initialized[m_count] = false;
-    m_init_time[m_count]   = 0;
-    m_count++;
-
-    if(m_logger != NULL)
-        m_logger.Info("ModuleRegistry", "Registered: " + name + " v" + version);
-    return true;
-}
-
-//+------------------------------------------------------------------+
-bool ModuleRegistry::MarkInitialized(const int module_id)
-{
-    int idx = FindIndex(module_id);
-    if(idx < 0)
-    {
-        if(m_logger != NULL)
-            m_logger.Error("ModuleRegistry", "MarkInitialized: module " + IntegerToString(module_id) + " not registered");
-        return false;
-    }
-
-    m_initialized[idx] = true;
-    m_init_time[idx]   = TimeCurrent();
-
-    if(m_logger != NULL)
-        m_logger.Info("ModuleRegistry", "Initialized: " + m_names[idx]);
-    return true;
-}
-
-//+------------------------------------------------------------------+
-bool ModuleRegistry::IsRegistered(const int module_id) const
-{
-    return (FindIndex(module_id) >= 0);
-}
-
-//+------------------------------------------------------------------+
-bool ModuleRegistry::IsInitialized(const int module_id) const
-{
-    int idx = FindIndex(module_id);
-    if(idx < 0) return false;
-    return m_initialized[idx];
-}
-
-//+------------------------------------------------------------------+
-string ModuleRegistry::GetName(const int module_id) const
-{
-    int idx = FindIndex(module_id);
-    if(idx < 0) return "";
-    return m_names[idx];
-}
-
-//+------------------------------------------------------------------+
-string ModuleRegistry::GetVersion(const int module_id) const
-{
-    int idx = FindIndex(module_id);
-    if(idx < 0) return "";
-    return m_versions[idx];
-}
-
-//+------------------------------------------------------------------+
-datetime ModuleRegistry::GetInitTime(const int module_id) const
-{
-    int idx = FindIndex(module_id);
-    if(idx < 0) return 0;
-    return m_init_time[idx];
-}
-
-//+------------------------------------------------------------------+
-bool ModuleRegistry::AllInitialized(void) const
-{
-    for(int i = 0; i < m_count; i++)
-    {
-        if(!m_initialized[i])
+        if(module_id <= 0)
+        {
+            if(m_logger != NULL)
+                m_logger.Error("ModuleRegistry", "Register: invalid module_id");
             return false;
+        }
+
+        if(FindIndex(module_id) >= 0)
+        {
+            if(m_logger != NULL)
+                m_logger.Warn("ModuleRegistry",
+                    "Register: " + name + " already registered");
+            return false;
+        }
+
+        if(m_count >= ATLAS_MODULE_MAX)
+        {
+            if(m_logger != NULL)
+                m_logger.Error("ModuleRegistry", "Register: registry full");
+            return false;
+        }
+
+        m_modules[m_count].module_id        = module_id;
+        m_modules[m_count].name             = name;
+        m_modules[m_count].version          = version;
+        m_modules[m_count].health           = ATLAS_MODULE_HEALTH_UNKNOWN;
+        m_modules[m_count].startup_order    = startup_order;
+        m_modules[m_count].shutdown_order   = shutdown_order;
+        m_modules[m_count].dependency_count = 0;
+        m_modules[m_count].initialized      = false;
+        m_modules[m_count].init_time        = 0;
+        m_modules[m_count].failure_reason   = "";
+        for(int j = 0; j < 8; j++)
+            m_modules[m_count].dependencies[j] = 0;
+
+        m_count++;
+
+        if(m_logger != NULL)
+            m_logger.Info("ModuleRegistry",
+                "Registered: " + name + " v" + version +
+                " (startup=" + IntegerToString(startup_order) +
+                " shutdown=" + IntegerToString(shutdown_order) + ")");
+        return true;
     }
-    return (m_count > 0);
-}
 
-//+------------------------------------------------------------------+
-void ModuleRegistry::Reset(void)
-{
-    m_count = 0;
-    for(int i = 0; i < MAX_MODULES; i++)
+    virtual bool MarkInitialized(const int module_id) override
     {
-        m_ids[i]         = 0;
-        m_names[i]       = "";
-        m_versions[i]    = "";
-        m_initialized[i] = false;
-        m_init_time[i]   = 0;
+        int idx = FindIndex(module_id);
+        if(idx < 0) return false;
+        m_modules[idx].initialized = true;
+        m_modules[idx].init_time   = TimeCurrent();
+        m_modules[idx].health      = ATLAS_MODULE_HEALTH_HEALTHY;
+        if(m_logger != NULL)
+            m_logger.Info("ModuleRegistry", "Initialized: " + m_modules[idx].name);
+        return true;
     }
-}
 
-//+------------------------------------------------------------------+
-void ModuleRegistry::LogStatus(void) const
-{
-    if(m_logger == NULL) return;
-
-    for(int i = 0; i < m_count; i++)
+    virtual bool MarkFailed(const int module_id, const string reason) override
     {
-        string status = m_initialized[i] ? "INITIALIZED" : "PENDING";
+        int idx = FindIndex(module_id);
+        if(idx < 0) return false;
+        m_modules[idx].health         = ATLAS_MODULE_HEALTH_FAILED;
+        m_modules[idx].failure_reason = reason;
+        if(m_logger != NULL)
+            m_logger.Error("ModuleRegistry",
+                "Failed: " + m_modules[idx].name + " — " + reason);
+        return true;
+    }
+
+    virtual void SetHealth(const int module_id, const int health) override
+    {
+        int idx = FindIndex(module_id);
+        if(idx < 0) return;
+        m_modules[idx].health = health;
+    }
+
+    virtual bool AddDependency(const int module_id, const int depends_on) override
+    {
+        int idx = FindIndex(module_id);
+        if(idx < 0) return false;
+        if(m_modules[idx].dependency_count >= 8) return false;
+        m_modules[idx].dependencies[m_modules[idx].dependency_count] = depends_on;
+        m_modules[idx].dependency_count++;
+        return true;
+    }
+
+    virtual bool Find(const int module_id, ModuleInfo &out) const override
+    {
+        int idx = FindIndex(module_id);
+        if(idx < 0) return false;
+        out = m_modules[idx];
+        return true;
+    }
+
+    virtual int GetStartupOrder(int out_ids[], const int max_count) const override
+    {
+        //--- Collect all module IDs
+        int ids[ATLAS_MODULE_MAX];
+        int orders[ATLAS_MODULE_MAX];
+        int n = 0;
+
+        for(int i = 0; i < m_count; i++)
+        {
+            ids[n]    = m_modules[i].module_id;
+            orders[n] = m_modules[i].startup_order;
+            n++;
+        }
+
+        //--- Sort by startup_order (ascending) — insertion sort
+        for(int i = 1; i < n; i++)
+        {
+            int key_id    = ids[i];
+            int key_order = orders[i];
+            int j = i - 1;
+            while(j >= 0 && orders[j] > key_order)
+            {
+                ids[j+1]    = ids[j];
+                orders[j+1] = orders[j];
+                j--;
+            }
+            ids[j+1]    = key_id;
+            orders[j+1] = key_order;
+        }
+
+        int result = (n < max_count) ? n : max_count;
+        for(int i = 0; i < result; i++)
+            out_ids[i] = ids[i];
+        return result;
+    }
+
+    virtual int GetShutdownOrder(int out_ids[], const int max_count) const override
+    {
+        //--- Same as startup but reversed
+        int ids[ATLAS_MODULE_MAX];
+        int orders[ATLAS_MODULE_MAX];
+        int n = 0;
+
+        for(int i = 0; i < m_count; i++)
+        {
+            ids[n]    = m_modules[i].module_id;
+            orders[n] = m_modules[i].shutdown_order;
+            n++;
+        }
+
+        //--- Sort by shutdown_order (ascending)
+        for(int i = 1; i < n; i++)
+        {
+            int key_id    = ids[i];
+            int key_order = orders[i];
+            int j = i - 1;
+            while(j >= 0 && orders[j] > key_order)
+            {
+                ids[j+1]    = ids[j];
+                orders[j+1] = orders[j];
+                j--;
+            }
+            ids[j+1]    = key_id;
+            orders[j+1] = key_order;
+        }
+
+        int result = (n < max_count) ? n : max_count;
+        for(int i = 0; i < result; i++)
+            out_ids[i] = ids[i];
+        return result;
+    }
+
+    virtual int Count(void) const override { return m_count; }
+
+    virtual int InitializedCount(void) const override
+    {
+        int c = 0;
+        for(int i = 0; i < m_count; i++)
+            if(m_modules[i].initialized) c++;
+        return c;
+    }
+
+    virtual bool AllInitialized(void) const override
+    {
+        if(m_count == 0) return false;
+        for(int i = 0; i < m_count; i++)
+            if(!m_modules[i].initialized) return false;
+        return true;
+    }
+
+    virtual void Clear(void) override
+    {
+        m_count = 0;
+        for(int i = 0; i < ATLAS_MODULE_MAX; i++)
+        {
+            m_modules[i].module_id        = 0;
+            m_modules[i].name             = "";
+            m_modules[i].version          = "";
+            m_modules[i].health           = ATLAS_MODULE_HEALTH_UNKNOWN;
+            m_modules[i].startup_order    = 999;
+            m_modules[i].shutdown_order   = 999;
+            m_modules[i].dependency_count = 0;
+            m_modules[i].initialized      = false;
+            m_modules[i].init_time        = 0;
+            m_modules[i].failure_reason   = "";
+        }
+    }
+
+    /**
+     * @brief Log all module statuses.
+     */
+    void LogStatus(void) const
+    {
+        if(m_logger == NULL) return;
         m_logger.Info("ModuleRegistry",
-            m_names[i] + " v" + m_versions[i] + " [" + status + "]");
+            "Modules: " + IntegerToString(m_count) +
+            " Initialized: " + IntegerToString(InitializedCount()));
+        for(int i = 0; i < m_count; i++)
+        {
+            string health_str;
+            switch(m_modules[i].health)
+            {
+                case ATLAS_MODULE_HEALTH_UNKNOWN:  health_str = "UNKNOWN";  break;
+                case ATLAS_MODULE_HEALTH_HEALTHY:  health_str = "HEALTHY";  break;
+                case ATLAS_MODULE_HEALTH_DEGRADED: health_str = "DEGRADED"; break;
+                case ATLAS_MODULE_HEALTH_FAILED:   health_str = "FAILED";   break;
+                default:                           health_str = "?";        break;
+            }
+            string init_str = m_modules[i].initialized ? "INIT" : "PENDING";
+            m_logger.Info("ModuleRegistry",
+                "  " + m_modules[i].name + " v" + m_modules[i].version +
+                " [" + init_str + "] [" + health_str + "]");
+        }
     }
-}
+};
 
 #endif // ATLAS_MODULE_REGISTRY_MQH
 //+------------------------------------------------------------------+

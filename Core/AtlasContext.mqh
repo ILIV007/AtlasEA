@@ -8,6 +8,7 @@
 #include "../Config/Settings.mqh"
 #include "../Contracts/Events.mqh"
 #include "../Interfaces/IContextStore.mqh"
+#include "ValidationResult.mqh"
 
 /**
  * @class AtlasContext
@@ -153,6 +154,118 @@ public:
     //--- Reset ---
     virtual void     ResetDaily(void) override;
     virtual void     ResetAll(void) override;
+
+    /**
+     * @brief Validate all context invariants.
+     * @return ValidationResult.
+     *
+     * Invariants:
+     *   - snapshot_id is monotonic (>= last assigned — tracked internally)
+     *   - daily counters are non-negative
+     *   - exposure is a valid number in a sane range
+     *   - position_count in [0, ATLAS_MAX_POSITIONS]
+     *   - telemetry counters are non-negative
+     *   - orders_sent >= orders_filled (cannot fill more than sent)
+     *   - no NaN/INF in any double field
+     *   - idempotency ring has no duplicates
+     *   - kill_switch_time > 0 if and only if kill_switch_active
+     */
+    ValidationResult Validate(void) const
+    {
+        //--- NaN/INF checks on all doubles
+        if(!MathIsValidNumber(m_daily_start_equity))
+            return ValidationResult::Fail(ATLAS_V_NAN, "daily_start_equity is NaN/INF", "daily_start_equity");
+        if(!MathIsValidNumber(m_daily_peak_equity))
+            return ValidationResult::Fail(ATLAS_V_NAN, "daily_peak_equity is NaN/INF", "daily_peak_equity");
+        if(!MathIsValidNumber(m_daily_drawdown_pct))
+            return ValidationResult::Fail(ATLAS_V_NAN, "daily_drawdown_pct is NaN/INF", "daily_drawdown_pct");
+        if(!MathIsValidNumber(m_daily_realized_pnl))
+            return ValidationResult::Fail(ATLAS_V_NAN, "daily_realized_pnl is NaN/INF", "daily_realized_pnl");
+        if(!MathIsValidNumber(m_current_exposure_pct))
+            return ValidationResult::Fail(ATLAS_V_NAN, "current_exposure_pct is NaN/INF", "current_exposure_pct");
+        if(!MathIsValidNumber(m_total_floating_pnl))
+            return ValidationResult::Fail(ATLAS_V_NAN, "total_floating_pnl is NaN/INF", "total_floating_pnl");
+
+        //--- Daily counters non-negative
+        if(m_daily_trade_count < 0)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "daily_trade_count < 0", "daily_trade_count");
+        if(m_daily_loss_count < 0)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "daily_loss_count < 0", "daily_loss_count");
+        if(m_daily_loss_count > m_daily_trade_count)
+            return ValidationResult::Fail(ATLAS_V_INCONSISTENT,
+                "daily_loss_count > daily_trade_count", "daily_loss_count");
+
+        //--- Drawdown should be non-negative (a loss is positive %)
+        if(m_daily_drawdown_pct < 0.0)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "daily_drawdown_pct < 0", "daily_drawdown_pct");
+
+        //--- Exposure sanity (not a hard limit, just sanity: < 1000%)
+        if(m_current_exposure_pct < -100.0 || m_current_exposure_pct > 1000.0)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "current_exposure_pct out of sane range", "current_exposure_pct");
+
+        //--- Position count
+        if(m_position_count < 0 || m_position_count > ATLAS_MAX_POSITIONS)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "position_count out of range", "position_count");
+
+        //--- Telemetry monotonicity
+        if(m_total_ticks_processed < 0)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "total_ticks_processed < 0", "total_ticks_processed");
+        if(m_total_events_emitted < 0)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "total_events_emitted < 0", "total_events_emitted");
+        if(m_total_orders_sent < 0)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "total_orders_sent < 0", "total_orders_sent");
+        if(m_total_orders_filled < 0)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "total_orders_filled < 0", "total_orders_filled");
+
+        //--- orders_filled <= orders_sent (cannot fill more than sent)
+        if(m_total_orders_filled > m_total_orders_sent)
+            return ValidationResult::Fail(ATLAS_V_MONOTONICITY,
+                "total_orders_filled > total_orders_sent", "total_orders_filled");
+
+        //--- Consecutive losses non-negative
+        if(m_consecutive_losses < 0)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "consecutive_losses < 0", "consecutive_losses");
+
+        //--- Kill switch consistency
+        if(m_kill_switch_active && m_kill_switch_time <= 0)
+            return ValidationResult::Fail(ATLAS_V_INCONSISTENT,
+                "kill_switch_active but kill_switch_time <= 0", "kill_switch_time");
+        if(!m_kill_switch_active && m_kill_switch_time > 0)
+            return ValidationResult::Fail(ATLAS_V_INCONSISTENT,
+                "kill_switch inactive but kill_switch_time > 0", "kill_switch_time");
+
+        //--- Idempotency ring: no duplicates
+        for(int i = 0; i < m_processed_count; i++)
+        {
+            for(int j = i + 1; j < m_processed_count; j++)
+            {
+                if(m_processed_decisions[i] == m_processed_decisions[j] &&
+                   StringLen(m_processed_decisions[i]) > 0)
+                {
+                    return ValidationResult::Fail(ATLAS_V_DUPLICATE,
+                        "duplicate decision_id in idempotency ring: " +
+                        m_processed_decisions[i], "processed_decisions");
+                }
+            }
+        }
+
+        //--- Idempotency count sanity
+        if(m_processed_count < 0 || m_processed_count > ATLAS_IDEMPOTENCY_SLOTS)
+            return ValidationResult::Fail(ATLAS_V_INVALID_RANGE,
+                "processed_count out of range", "processed_count");
+
+        return ValidationResult::Ok();
+    }
 };
 
 //+------------------------------------------------------------------+

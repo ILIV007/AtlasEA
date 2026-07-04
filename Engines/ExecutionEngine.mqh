@@ -8,7 +8,11 @@
 #include "../Config/Settings.mqh"
 #include "../Contracts/RiskDecision.mqh"
 #include "../Contracts/MarketState.mqh"
-#include "../Core/AtlasContext.mqh"
+#include "../Core/ValidationResult.mqh"
+#include "../Interfaces/IOrderBuilder.mqh"
+#include "../Interfaces/IContextStore.mqh"
+#include "../Interfaces/ILogger.mqh"
+#include "../Interfaces/IBrokerAdapter.mqh"
 
 //+------------------------------------------------------------------+
 //| ExecutionEngine                                                  |
@@ -18,11 +22,13 @@
 //|   - enforces SL/TP stops-level distance                          |
 //|   - builds the final OrderRequest                                |
 //+------------------------------------------------------------------+
-class ExecutionEngine
+class ExecutionEngine : public IOrderBuilder
 {
 private:
-    AtlasConfig    m_config;
-    AtlasContext  *m_context;
+    AtlasConfig     m_config;
+    IContextStore  *m_context;
+    ILogger        *m_logger;
+    IBrokerAdapter *m_broker;
 
     bool   ValidateDecision(const RiskDecision &dec) const;
     bool   CheckIdempotency(const string &decision_id) const;
@@ -34,15 +40,65 @@ private:
 
 public:
                 ExecutionEngine(void);
-    bool        Initialize(const AtlasConfig &config, AtlasContext *context);
-    bool        BuildOrderRequest(const RiskDecision &dec, const MarketState &state, OrderRequest &req);
+
+    //--- IOrderBuilder overrides ---
+    virtual bool   Initialize(void) override { return true; }
+    virtual void   Shutdown(void) override { m_context = NULL; m_broker = NULL; }
+    virtual bool   BuildOrderRequest(const RiskDecision &dec, const MarketState &state, OrderRequest &req) override;
+
+    //--- Extended init (called by Bootstrapper) ---
+    void SetDependencies(ILogger *logger, IContextStore *context, IBrokerAdapter *broker, const AtlasConfig &config);
+    bool Initialize(const AtlasConfig &config, IContextStore *context);
+
+    //=== Design by Contract (v0.1.26.x) ===
+
+    /**
+     * @brief Validate internal state for consistency.
+     * @return ValidationResult — Ok() if all invariants hold, Fail() otherwise.
+     *
+     * Invariants checked:
+     *   - m_logger != NULL (required dependency)
+     *   - m_broker != NULL (required dependency — also serves as the
+     *     "initialized" sentinel since Shutdown() nulls it;
+     *     ExecutionEngine has no explicit m_initialized flag)
+     *
+     * Non-throwing (MQL5 has no exceptions).
+     */
+    ValidationResult Validate(void) const
+    {
+        if(m_logger == NULL)
+            return ValidationResult::Fail(ATLAS_V_NOT_INITIALIZED,
+                "logger is NULL", "m_logger");
+        if(m_broker == NULL)
+            return ValidationResult::Fail(ATLAS_V_NOT_INITIALIZED,
+                "broker adapter is NULL", "m_broker");
+        return ValidationResult::Ok();
+    }
+
+    /// @brief Convenience wrapper — true if Validate() passes.
+    bool IsValid(void) const { return Validate().valid; }
 };
 
 //+------------------------------------------------------------------+
-ExecutionEngine::ExecutionEngine(void) { m_context = NULL; }
+ExecutionEngine::ExecutionEngine(void)
+{
+    m_context = NULL;
+    m_logger  = NULL;
+    m_broker  = NULL;
+}
 
 //+------------------------------------------------------------------+
-bool ExecutionEngine::Initialize(const AtlasConfig &config, AtlasContext *context)
+void ExecutionEngine::SetDependencies(ILogger *logger, IContextStore *context,
+                                       IBrokerAdapter *broker, const AtlasConfig &config)
+{
+    m_logger  = logger;
+    m_context = context;
+    m_broker  = broker;
+    m_config  = config;
+}
+
+//+------------------------------------------------------------------+
+bool ExecutionEngine::Initialize(const AtlasConfig &config, IContextStore *context)
 {
     m_config  = config;
     m_context = context;
@@ -71,9 +127,9 @@ bool ExecutionEngine::CheckIdempotency(const string &decision_id) const
 //+------------------------------------------------------------------+
 double ExecutionEngine::NormalizeVolume(double v) const
 {
-    double min_lot = SymbolInfoDouble(m_config.symbol, SYMBOL_VOLUME_MIN);
-    double max_lot = SymbolInfoDouble(m_config.symbol, SYMBOL_VOLUME_MAX);
-    double step    = SymbolInfoDouble(m_config.symbol, SYMBOL_VOLUME_STEP);
+    double min_lot = m_broker.SymbolVolumeMin();
+    double max_lot = m_broker.SymbolVolumeMax();
+    double step    = m_broker.SymbolVolumeStep();
     if(step <= 0.0) step = 0.01;
     double rounded = MathRound(v / step) * step;
     if(rounded < min_lot) rounded = min_lot;
@@ -85,8 +141,8 @@ double ExecutionEngine::NormalizeVolume(double v) const
 //+------------------------------------------------------------------+
 double ExecutionEngine::GetMinStopDistance(void) const
 {
-    long   stop_level = SymbolInfoInteger(m_config.symbol, SYMBOL_TRADE_STOPS_LEVEL);
-    double point      = SymbolInfoDouble(m_config.symbol, SYMBOL_POINT);
+    long   stop_level = m_broker.SymbolStopsLevel();
+    double point      = m_broker.SymbolPoint();
     double dist       = (double)stop_level * point;
     //--- add a small buffer so we never sit exactly on the stops-level
     return dist + point * 2.0;
@@ -96,7 +152,7 @@ double ExecutionEngine::GetMinStopDistance(void) const
 double ExecutionEngine::ValidateStopLoss(double sl, int direction, double entry) const
 {
     double min_dist = GetMinStopDistance();
-    int    digits   = (int)SymbolInfoInteger(m_config.symbol, SYMBOL_DIGITS);
+    int    digits   = m_broker.SymbolDigits();
     if(direction == ATLAS_ORDER_BUY)
     {
         double max_sl = entry - min_dist;
@@ -114,7 +170,7 @@ double ExecutionEngine::ValidateStopLoss(double sl, int direction, double entry)
 double ExecutionEngine::ValidateTakeProfit(double tp, int direction, double entry) const
 {
     double min_dist = GetMinStopDistance();
-    int    digits   = (int)SymbolInfoInteger(m_config.symbol, SYMBOL_DIGITS);
+    int    digits   = m_broker.SymbolDigits();
     if(direction == ATLAS_ORDER_BUY)
     {
         double min_tp = entry + min_dist;
@@ -145,10 +201,11 @@ bool ExecutionEngine::BuildOrderRequest(const RiskDecision &dec,
                                         OrderRequest &req)
 {
     if(m_context == NULL)               return false;
+    if(m_broker == NULL)                return false;
     if(!ValidateDecision(dec))          return false;
     if(!CheckIdempotency(dec.decision_id)) return false;
 
-    req.request_id    = "REQ_" + IntegerToString((long)TimeCurrent()) + "_" + IntegerToString(MathRand());
+    req.request_id    = "REQ_" + IntegerToString(dec.snapshot_id);
     req.decision_id   = dec.decision_id;
     req.symbol        = m_config.symbol;
     req.direction     = dec.order_type;
@@ -156,8 +213,8 @@ bool ExecutionEngine::BuildOrderRequest(const RiskDecision &dec,
     req.volume        = NormalizeVolume(dec.approved_volume);
 
     //--- entry price: use current market for market orders
-    double bid = SymbolInfoDouble(m_config.symbol, SYMBOL_BID);
-    double ask = SymbolInfoDouble(m_config.symbol, SYMBOL_ASK);
+    double bid = m_broker.SymbolBid();
+    double ask = m_broker.SymbolAsk();
     req.entry_price   = (req.direction == ATLAS_ORDER_BUY) ? ask : bid;
 
     //--- enforce stops-level distance

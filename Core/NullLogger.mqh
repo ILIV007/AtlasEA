@@ -22,6 +22,7 @@ public:
     ~NullLogger(void) {}
 
     virtual void Log(const int level, const string module, const string message) override {}
+    virtual void Trace(const string module, const string message) override {}
     virtual void Debug(const string module, const string message) override {}
     virtual void Info(const string module, const string message) override {}
     virtual void Warn(const string module, const string message) override {}

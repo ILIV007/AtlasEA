@@ -62,6 +62,13 @@ public:
     void Reset(void);
 
     /**
+     * @brief Add a closed bar to the buffer (alias for AddBar).
+     * If the buffer is full, the oldest bar is evicted (FIFO).
+     * @param bar The closed bar to add.
+     */
+    void Push(const BarData &bar) { AddBar(bar); }
+
+    /**
      * @brief Add a closed bar to the buffer.
      * If the buffer is full, the oldest bar is evicted (FIFO).
      * @param bar The closed bar to add.
@@ -112,6 +119,28 @@ public:
      * @brief true if the buffer is at capacity.
      */
     bool IsFull(void) const { return m_count >= ATLAS_BAR_BUFFER_CAPACITY; }
+
+    /**
+     * @brief true if the buffer has enough bars for indicator calculations.
+     * Typically requires at least 'min_bars' bars (default: 14 for ATR).
+     * @param min_bars Minimum bars required (default 14).
+     * @return true if Count() >= min_bars.
+     */
+    bool IsReady(const int min_bars = 14) const { return m_count >= min_bars; }
+
+    /**
+     * @brief Get the newest (most recently closed) bar (alias for GetNewest).
+     * @param out Output: copy of the newest bar.
+     * @return true if buffer is not empty.
+     */
+    bool Current(BarData &out) const { return GetNewest(out); }
+
+    /**
+     * @brief Get the second-newest bar (the bar before the current/newest).
+     * @param out Output: copy of the previous bar.
+     * @return true if buffer has at least 2 bars.
+     */
+    bool Previous(BarData &out) const;
 
     /**
      * @brief Get the newest (most recently closed) bar.
@@ -233,6 +262,18 @@ bool BarBuffer::GetNewest(BarData &out) const
         return false;
     }
     out = m_bars[m_count - 1];
+    return true;
+}
+
+//+------------------------------------------------------------------+
+bool BarBuffer::Previous(BarData &out) const
+{
+    if(m_count < 2)
+    {
+        ZeroMemory(out);
+        return false;
+    }
+    out = m_bars[m_count - 2];
     return true;
 }
 
