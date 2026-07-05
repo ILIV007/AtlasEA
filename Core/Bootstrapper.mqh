@@ -41,8 +41,10 @@
 #include "../Engines/StrategyEngine.mqh"
 #include "../Engines/RiskEngine.mqh"
 #include "../Engines/ExecutionEngine.mqh"
+#include "../Engines/MoneyManagementEngine.mqh"
 #include "../Infrastructure/MT5Adapter.mqh"
 #include "../Infrastructure/TradeManager.mqh"
+#include "../Infrastructure/TradeLifecycleManager.mqh"
 #include "../Infrastructure/PersistenceManager.mqh"
 #include "../Recovery/RecoveryManager.mqh"
 
@@ -93,6 +95,8 @@ private:
     StrategyEngine     *m_strategy;
     RiskEngine         *m_risk;
     ExecutionEngine    *m_execution;
+    MoneyManagementEngine *m_money_mgmt;
+    TradeLifecycleManager *m_trade_lifecycle;
     CoreEngine         *m_core;
 
     //=== State ===
@@ -158,6 +162,11 @@ private:
         if(m_trade == NULL) return false;
         m_container.RegisterSingleton(ATLAS_DEP_TRADE_MANAGER, "TradeManager", m_trade);
 
+        m_trade_lifecycle = new TradeLifecycleManager();
+        if(m_trade_lifecycle == NULL) return false;
+        m_trade_lifecycle.SetLogger(m_logger);
+        m_trade_lifecycle.SetConfig(m_config);
+
         return true;
     }
 
@@ -188,6 +197,11 @@ private:
         m_execution = new ExecutionEngine();
         if(m_execution == NULL) return false;
         m_container.RegisterSingleton(ATLAS_DEP_EXECUTION_ENGINE, "ExecutionEngine", m_execution);
+
+        m_money_mgmt = new MoneyManagementEngine();
+        if(m_money_mgmt == NULL) return false;
+        m_money_mgmt.SetLogger(m_logger);
+        m_money_mgmt.SetConfig(m_config);
 
         return true;
     }
@@ -256,6 +270,7 @@ private:
         m_strategy.SetDependencies(m_logger, context, m_config);
         m_risk.SetDependencies(m_logger, context, m_broker, m_config);
         m_execution.SetDependencies(m_logger, context, m_broker, m_config);
+        m_execution.SetMoneyManagement(m_money_mgmt);
 
         //--- TradeManager: needs event_bus, logger, context, broker, config
         m_trade.SetDependencies(m_core, m_logger, context, m_broker, m_config);
@@ -312,6 +327,8 @@ public:
         m_strategy     = NULL;
         m_risk         = NULL;
         m_execution    = NULL;
+        m_money_mgmt   = NULL;
+        m_trade_lifecycle = NULL;
         m_core         = NULL;
         m_last_result  = ATLAS_BOOTSTRAP_FAILED;
         m_failure_reason = "";
@@ -369,6 +386,12 @@ public:
         if(m_execution   == NULL)
             return ValidationResult::Fail(ATLAS_V_NOT_INITIALIZED,
                 "ExecutionEngine not created", "m_execution");
+        if(m_money_mgmt  == NULL)
+            return ValidationResult::Fail(ATLAS_V_NOT_INITIALIZED,
+                "MoneyManagementEngine not created", "m_money_mgmt");
+        if(m_trade_lifecycle == NULL)
+            return ValidationResult::Fail(ATLAS_V_NOT_INITIALIZED,
+                "TradeLifecycleManager not created", "m_trade_lifecycle");
         if(m_persistence == NULL)
             return ValidationResult::Fail(ATLAS_V_NOT_INITIALIZED,
                 "PersistenceManager not created", "m_persistence");
@@ -517,6 +540,24 @@ public:
         //==============================================================
         // STEP 11: Mark all modules as initialized
         //==============================================================
+        //--- v1.0: Initialize MoneyManagementEngine
+        if(!m_money_mgmt.Initialize())
+        {
+            m_failure_reason = "MoneyManagementEngine.Initialize() failed";
+            m_lifecycle.Fail(m_failure_reason);
+            m_last_result = ATLAS_BOOTSTRAP_FAILED;
+            Shutdown();
+            return NULL;
+        }
+        //--- v1.0 Step 2: Initialize TradeLifecycleManager
+        if(!m_trade_lifecycle.Initialize())
+        {
+            m_failure_reason = "TradeLifecycleManager.Initialize() failed";
+            m_lifecycle.Fail(m_failure_reason);
+            m_last_result = ATLAS_BOOTSTRAP_FAILED;
+            Shutdown();
+            return NULL;
+        }
         MarkAllInitialized();
 
         //==============================================================
@@ -603,6 +644,8 @@ public:
 
         //--- 10-7. Engines (reverse order)
         if(m_execution != NULL)   { m_execution.Shutdown(); delete m_execution; m_execution = NULL; }
+        if(m_money_mgmt != NULL)  { m_money_mgmt.Shutdown(); delete m_money_mgmt; m_money_mgmt = NULL; }
+        if(m_trade_lifecycle != NULL) { m_trade_lifecycle.Shutdown(); delete m_trade_lifecycle; m_trade_lifecycle = NULL; }
         if(m_risk != NULL)        { m_risk.Shutdown();     delete m_risk;       m_risk = NULL; }
         if(m_strategy != NULL)    { m_strategy.Shutdown(); delete m_strategy;   m_strategy = NULL; }
         if(m_market != NULL)      { m_market.Shutdown();   delete m_market;     m_market = NULL; }

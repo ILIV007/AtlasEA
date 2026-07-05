@@ -13,6 +13,7 @@
 #include "../Interfaces/IContextStore.mqh"
 #include "../Interfaces/ILogger.mqh"
 #include "../Interfaces/IBrokerAdapter.mqh"
+#include "../Interfaces/IMoneyManagement.mqh"
 
 //+------------------------------------------------------------------+
 //| ExecutionEngine                                                  |
@@ -25,14 +26,15 @@
 class ExecutionEngine : public IOrderBuilder
 {
 private:
-    AtlasConfig     m_config;
-    IContextStore  *m_context;
-    ILogger        *m_logger;
-    IBrokerAdapter *m_broker;
+    AtlasConfig        m_config;
+    IContextStore     *m_context;
+    ILogger           *m_logger;
+    IBrokerAdapter    *m_broker;
+    IMoneyManagement  *m_money_mgmt;  ///< v1.0: final volume comes from here ONLY
 
     bool   ValidateDecision(const RiskDecision &dec) const;
     bool   CheckIdempotency(const string &decision_id) const;
-    double NormalizeVolume(double v) const;
+    double NormalizeVolume(double v) const;  ///< Fallback if no MM engine
     double ValidateStopLoss(double sl, int direction, double entry) const;
     double ValidateTakeProfit(double tp, int direction, double entry) const;
     double GetMinStopDistance(void) const;
@@ -49,6 +51,11 @@ public:
     //--- Extended init (called by Bootstrapper) ---
     void SetDependencies(ILogger *logger, IContextStore *context, IBrokerAdapter *broker, const AtlasConfig &config);
     bool Initialize(const AtlasConfig &config, IContextStore *context);
+
+    //--- v1.0: Money Management integration ---
+    /// @brief Set the Money Management engine.
+    /// Final volume is requested ONLY from this interface.
+    void SetMoneyManagement(IMoneyManagement *mm) { m_money_mgmt = mm; }
 
     //=== Design by Contract (v0.1.26.x) ===
 
@@ -82,9 +89,10 @@ public:
 //+------------------------------------------------------------------+
 ExecutionEngine::ExecutionEngine(void)
 {
-    m_context = NULL;
-    m_logger  = NULL;
-    m_broker  = NULL;
+    m_context    = NULL;
+    m_logger     = NULL;
+    m_broker     = NULL;
+    m_money_mgmt = NULL;
 }
 
 //+------------------------------------------------------------------+
@@ -195,6 +203,10 @@ string ExecutionEngine::BuildBrokerComment(const string &req_id, const string &d
 
 //+------------------------------------------------------------------+
 //| BuildOrderRequest - the main entry point                         |
+//|                                                                  |
+//| v1.0: Final volume is requested ONLY from IMoneyManagement.      |
+//|       The RiskDecision's approved_volume is treated as a hint;   |
+//|       the MoneyManagementEngine computes the final validated lot.|
 //+------------------------------------------------------------------+
 bool ExecutionEngine::BuildOrderRequest(const RiskDecision &dec,
                                         const MarketState &state,
@@ -210,7 +222,35 @@ bool ExecutionEngine::BuildOrderRequest(const RiskDecision &dec,
     req.symbol        = m_config.symbol;
     req.direction     = dec.order_type;
     req.order_type    = (dec.order_type == ATLAS_ORDER_BUY) ? (int)ORDER_TYPE_BUY : (int)ORDER_TYPE_SELL;
-    req.volume        = NormalizeVolume(dec.approved_volume);
+
+    //=== v1.0: Final volume from MoneyManagementEngine ONLY ===
+    double final_volume = 0.0;
+    if(m_money_mgmt != NULL)
+    {
+        VolumeResult vr = m_money_mgmt.CalculateVolume(dec, state, m_broker, m_context);
+        if(!vr.accepted)
+        {
+            if(m_logger != NULL)
+                m_logger.Error("ExecutionEngine",
+                    "Volume rejected by MoneyManagement [" + vr.mode_name + "]: " +
+                    MoneyManagementErrorName(vr.error_code) + " " + vr.error_detail);
+            return false;
+        }
+        final_volume = vr.volume;
+        if(m_logger != NULL)
+            m_logger.Debug("ExecutionEngine",
+                "Volume from MM: " + DoubleToString(final_volume, 2) +
+                " risk=" + DoubleToString(vr.risk_pct, 2) + "%" +
+                " margin=" + DoubleToString(vr.margin_required, 2) +
+                " lev=" + DoubleToString(vr.leverage, 2));
+    }
+    else
+    {
+        //--- Fallback: use the legacy NormalizeVolume if no MM engine
+        //--- (backward compatibility — should not happen in v1.0 production)
+        final_volume = NormalizeVolume(dec.approved_volume);
+    }
+    req.volume = final_volume;
 
     //--- entry price: use current market for market orders
     double bid = m_broker.SymbolBid();

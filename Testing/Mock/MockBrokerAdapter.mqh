@@ -42,6 +42,10 @@ private:
     double            m_contract_size;
     long              m_filling_mode;
     long              m_stops_level;
+    double            m_tick_value;
+    double            m_tick_size;
+    double            m_margin_initial;
+    long              m_leverage;
     int               m_period_seconds;
     string            m_symbol;
     long              m_magic;
@@ -105,6 +109,10 @@ public:
         m_contract_size   = 100000.0;
         m_filling_mode    = 1;  ///< FOK
         m_stops_level     = 10;
+        m_tick_value      = 1.0;
+        m_tick_size       = 0.00001;
+        m_margin_initial  = 1000.0;
+        m_leverage        = 100;
         m_period_seconds  = 60;
         m_symbol          = "EURUSD";
         m_magic           = 999999;
@@ -258,6 +266,24 @@ public:
         return m_positions.CloseAll(m_bid, m_ask);
     }
 
+    virtual bool ModifyPositionSLTP(const string position_id, double sl, double tp) override
+    {
+        //--- Mock: accept all modifications
+        return (StringLen(position_id) > 0);
+    }
+
+    virtual bool ClosePosition(const string position_id) override
+    {
+        //--- Mock: accept close, return true (test harness handles state)
+        return (StringLen(position_id) > 0);
+    }
+
+    virtual bool ClosePartialPosition(const string position_id, double volume) override
+    {
+        //--- Mock: accept partial close if volume is valid
+        return (StringLen(position_id) > 0 && volume > 0.0);
+    }
+
     virtual PositionSnapshotEvent QueryBrokerPositions(void) override
     {
         return m_positions.ToSnapshotEvent();
@@ -285,6 +311,10 @@ public:
     virtual long   SymbolStopsLevel(void) override     { return m_stops_level; }
     virtual double SymbolContractSize(void) override   { return m_contract_size; }
     virtual long   SymbolFillingMode(void) override    { return m_filling_mode; }
+    virtual double SymbolTickValue(void) override      { return m_tick_value; }
+    virtual double SymbolTickSize(void) override       { return m_tick_size; }
+    virtual double SymbolMarginInitial(void) override  { return m_margin_initial; }
+    virtual long   AccountLeverage(void) override      { return m_leverage; }
 
     //--- Indicator management (mock) ---
     virtual int CreateATR(int period) override              { return AllocHandle(); }

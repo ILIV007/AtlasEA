@@ -51,6 +51,9 @@ public:
     virtual void        CaptureTrade(void) override;
     virtual bool        SendOrder(const OrderRequest &req) override;
     virtual int         CloseAllPositionsForMagic(const string reason) override;
+    virtual bool        ModifyPositionSLTP(const string position_id, double sl, double tp) override;
+    virtual bool        ClosePosition(const string position_id) override;
+    virtual bool        ClosePartialPosition(const string position_id, double volume) override;
     virtual PositionSnapshotEvent QueryBrokerPositions(void) override;
     virtual int         CountPositionsForMagic(void) override;
     virtual double      AccountEquity(void) override;
@@ -67,6 +70,10 @@ public:
     virtual long        SymbolStopsLevel(void) override;
     virtual double      SymbolContractSize(void) override;
     virtual long        SymbolFillingMode(void) override;
+    virtual double      SymbolTickValue(void) override;
+    virtual double      SymbolTickSize(void) override;
+    virtual double      SymbolMarginInitial(void) override;
+    virtual long        AccountLeverage(void) override;
     virtual int         CreateATR(int period) override;
     virtual int         CreateMA(int period, int ma_method, int applied_price) override;
     virtual int         CreateRSI(int period, int applied_price) override;
@@ -354,6 +361,86 @@ int MT5Adapter::CloseAllPositionsForMagic(const string reason)
     return closed;
 }
 
+//+------------------------------------------------------------------+
+//| ModifyPositionSLTP - modify SL/TP of an open position            |
+//+------------------------------------------------------------------+
+bool MT5Adapter::ModifyPositionSLTP(const string position_id, double sl, double tp)
+{
+    ulong ticket = (ulong)StringToInteger(position_id);
+    if(ticket == 0) return false;
+    if(!PositionSelectByTicket(ticket)) return false;
+
+    MqlTradeRequest req; MqlTradeResult res;
+    ZeroMemory(req); ZeroMemory(res);
+    req.action   = TRADE_ACTION_SLTP;
+    req.position = ticket;
+    req.symbol   = PositionGetString(POSITION_SYMBOL);
+    req.sl       = sl;
+    req.tp       = tp;
+    req.magic    = (ulong)m_config.magic_number;
+    return OrderSend(req, res);
+}
+
+//+------------------------------------------------------------------+
+//| ClosePosition - fully close a position at market                 |
+//+------------------------------------------------------------------+
+bool MT5Adapter::ClosePosition(const string position_id)
+{
+    ulong ticket = (ulong)StringToInteger(position_id);
+    if(ticket == 0) return false;
+    if(!PositionSelectByTicket(ticket)) return false;
+
+    MqlTradeRequest req; MqlTradeResult res;
+    ZeroMemory(req); ZeroMemory(res);
+    req.action    = TRADE_ACTION_DEALS;
+    req.position  = ticket;
+    req.symbol    = PositionGetString(POSITION_SYMBOL);
+    req.volume    = PositionGetDouble(POSITION_VOLUME);
+    long ptype    = PositionGetInteger(POSITION_TYPE);
+    req.type      = (ptype == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+    req.price     = (ptype == POSITION_TYPE_BUY) ? SymbolInfoDouble(req.symbol, SYMBOL_BID)
+                                                 : SymbolInfoDouble(req.symbol, SYMBOL_ASK);
+    req.deviation = (ulong)m_config.slippage_points;
+    req.magic     = (ulong)m_config.magic_number;
+    req.comment   = "AtlasEA_Close";
+    req.type_filling = ORDER_FILLING_IOC;
+    return OrderSend(req, res);
+}
+
+//+------------------------------------------------------------------+
+//| ClosePartialPosition - partially close a position                |
+//+------------------------------------------------------------------+
+bool MT5Adapter::ClosePartialPosition(const string position_id, double volume)
+{
+    ulong ticket = (ulong)StringToInteger(position_id);
+    if(ticket == 0) return false;
+    if(!PositionSelectByTicket(ticket)) return false;
+
+    double pos_vol = PositionGetDouble(POSITION_VOLUME);
+    if(volume <= 0.0 || volume >= pos_vol) return false;
+
+    //--- Normalize to volume step
+    double step = SymbolInfoDouble(PositionGetString(POSITION_SYMBOL), SYMBOL_VOLUME_STEP);
+    if(step > 0.0) volume = MathRound(volume / step) * step;
+    if(volume <= 0.0) return false;
+
+    MqlTradeRequest req; MqlTradeResult res;
+    ZeroMemory(req); ZeroMemory(res);
+    req.action    = TRADE_ACTION_DEALS;
+    req.position  = ticket;
+    req.symbol    = PositionGetString(POSITION_SYMBOL);
+    req.volume    = volume;
+    long ptype    = PositionGetInteger(POSITION_TYPE);
+    req.type      = (ptype == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+    req.price     = (ptype == POSITION_TYPE_BUY) ? SymbolInfoDouble(req.symbol, SYMBOL_BID)
+                                                 : SymbolInfoDouble(req.symbol, SYMBOL_ASK);
+    req.deviation = (ulong)m_config.slippage_points;
+    req.magic     = (ulong)m_config.magic_number;
+    req.comment   = "AtlasEA_Partial";
+    req.type_filling = ORDER_FILLING_IOC;
+    return OrderSend(req, res);
+}
+
 int MT5Adapter::CountPositionsForMagic(void)
 {
     int count = 0;
@@ -382,6 +469,10 @@ double MT5Adapter::SymbolVolumeStep(void)   { return SymbolInfoDouble(m_config.s
 long   MT5Adapter::SymbolStopsLevel(void)   { return SymbolInfoInteger(m_config.symbol, SYMBOL_TRADE_STOPS_LEVEL); }
 double MT5Adapter::SymbolContractSize(void) { return SymbolInfoDouble(m_config.symbol, SYMBOL_TRADE_CONTRACT_SIZE); }
 long   MT5Adapter::SymbolFillingMode(void)  { return SymbolInfoInteger(m_config.symbol, SYMBOL_FILLING_MODE); }
+double MT5Adapter::SymbolTickValue(void)    { return SymbolInfoDouble(m_config.symbol, SYMBOL_TRADE_TICK_VALUE); }
+double MT5Adapter::SymbolTickSize(void)     { return SymbolInfoDouble(m_config.symbol, SYMBOL_TRADE_TICK_SIZE); }
+double MT5Adapter::SymbolMarginInitial(void) { return SymbolInfoDouble(m_config.symbol, SYMBOL_MARGIN_INITIAL); }
+long   MT5Adapter::AccountLeverage(void)    { return AccountInfoInteger(ACCOUNT_LEVERAGE); }
 
 int MT5Adapter::CreateATR(int period)              { return iATR(m_config.symbol, PERIOD_CURRENT, period); }
 int MT5Adapter::CreateMA(int p, int m, int ap)     { return iMA(m_config.symbol, PERIOD_CURRENT, p, 0, m, ap); }

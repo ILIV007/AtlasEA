@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
 //|                                                       AtlasEA.mq5|
-//|                                              AtlasEA v0.1.21.0   |
+//|                                              AtlasEA v1.0 RC     |
 //|                Event-Driven Multi-Strategy Expert Advisor        |
 //|                                                                  |
-//|  v0.1.21.0: Production DI Container + Bootstrapper.             |
+//|  v1.0 RC: Production Release Candidate.                          |
 //|  AtlasEA.mq5 is a thin entry point:                              |
 //|    1. Create Bootstrapper                                        |
 //|    2. Bootstrap application                                      |
@@ -11,11 +11,11 @@
 //|    4. Run                                                        |
 //|    5. Shutdown through Bootstrapper                              |
 //+------------------------------------------------------------------+
-#property copyright   "AtlasEA v0.1.21.0"
+#property copyright   "AtlasEA v1.0 RC"
 #property link        "https://atlas.example"
-#property version     "0.21"
+#property version     "1.00"
 #property description "AtlasEA - event-driven, multi-strategy EA"
-#property description "Production DI container + bootstrapper"
+#property description "Production Release Candidate v1.0"
 
 #include "Core/Bootstrapper.mqh"
 
@@ -98,7 +98,13 @@ int OnInit(void)
         return INIT_FAILED;
     }
 
-    Print("AtlasEA v0.1.21.0: initialized successfully on ", cfg.symbol);
+    //--- Logger is now available via Bootstrapper; use it for success message.
+    //--- Print() is only used above for FATAL pre-logger errors.
+    Logger *logger = g_bootstrapper.GetLogger();
+    if(logger != NULL)
+        logger.Info("AtlasEA", "v1.0 RC initialized successfully on " + cfg.symbol);
+    else
+        Print("AtlasEA v1.0 RC: initialized successfully on ", cfg.symbol);
     return INIT_SUCCEEDED;
 }
 

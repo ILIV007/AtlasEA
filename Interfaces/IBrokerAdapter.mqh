@@ -42,6 +42,31 @@ public:
      */
     virtual int CloseAllPositionsForMagic(const string reason) = 0;
 
+    //--- Position modification (v1.0 Step 2: Trade Lifecycle Manager) ---
+    /**
+     * @brief Modify a position's stop loss and/or take profit.
+     * @param position_id The position ticket as a string.
+     * @param sl          New stop loss (0 = no change).
+     * @param tp          New take profit (0 = no change).
+     * @return true if the modification was accepted by the broker.
+     */
+    virtual bool ModifyPositionSLTP(const string position_id, double sl, double tp) = 0;
+
+    /**
+     * @brief Close a position fully at market.
+     * @param position_id The position ticket as a string.
+     * @return true if the close order was accepted.
+     */
+    virtual bool ClosePosition(const string position_id) = 0;
+
+    /**
+     * @brief Close part of a position (partial close).
+     * @param position_id The position ticket as a string.
+     * @param volume      Volume to close (must be < position volume).
+     * @return true if the partial close was accepted.
+     */
+    virtual bool ClosePartialPosition(const string position_id, double volume) = 0;
+
     //--- Position queries ---
     /// @brief Query all broker positions matching the EA's magic number.
     virtual PositionSnapshotEvent QueryBrokerPositions(void) = 0;
@@ -66,6 +91,18 @@ public:
     virtual long   SymbolStopsLevel(void) = 0;
     virtual double SymbolContractSize(void) = 0;
     virtual long   SymbolFillingMode(void) = 0;
+
+    //--- Tick value / tick size (for accurate money calculations) ---
+    /// @brief Symbol tick value in account currency (SYMBOL_TRADE_TICK_VALUE).
+    virtual double SymbolTickValue(void) = 0;
+    /// @brief Symbol tick size in price units (SYMBOL_TRADE_TICK_SIZE).
+    virtual double SymbolTickSize(void) = 0;
+
+    //--- Margin / leverage ---
+    /// @brief Initial margin required for 1 lot (SYMBOL_MARGIN_INITIAL).
+    virtual double SymbolMarginInitial(void) = 0;
+    /// @brief Account leverage (ACCOUNT_LEVERAGE).
+    virtual long   AccountLeverage(void) = 0;
 
     //--- Indicator management ---
     virtual int    CreateATR(int period) = 0;
